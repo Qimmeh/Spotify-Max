@@ -3,6 +3,7 @@ const net = require('net');
 const path = require('path');
 const fs = require('fs');
 const { execFile, spawn } = require('child_process');
+const phantomSpotifyEngine = require('./phantom-engine');
 
 let mainWindow = null;
 let localServer = null;
@@ -36,6 +37,7 @@ const NETEASE_LOGIN_PARTITION = 'persist:mineradio-netease-login';
 const NETEASE_LOGIN_URL = 'https://music.163.com/#/login';
 const QQ_LOGIN_PARTITION = 'persist:mineradio-qqmusic-login';
 const QQ_LOGIN_URL = 'https://y.qq.com/n/ryqq/profile';
+const SPOTIFY_LOGIN_PARTITION = 'persist:mineradio-spotify-login';
 
 const CHROMIUM_PERFORMANCE_SWITCHES = [
   ['autoplay-policy', 'no-user-gesture-required'],
@@ -1244,16 +1246,60 @@ ipcMain.handle('phantom-spotify-open-login', async (event) => {
 });
 
 ipcMain.handle('phantom-spotify-get-token', async () => {
-  return phantomToken;
+  return phantomToken || await refreshPhantomSpotifyToken();
 });
 
 ipcMain.handle('phantom-spotify-execute', async (event, jsCode) => {
+  createPhantomPlayer();
   if (!phantomWindow || phantomWindow.isDestroyed()) return { ok: false, error: 'NO_PHANTOM' };
   try {
     const result = await phantomWindow.webContents.executeJavaScript(jsCode);
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('phantom-spotify-play-uri', async (event, uri) => {
+  try {
+    if (!uri || !/^spotify:track:[A-Za-z0-9]+$/.test(String(uri))) {
+      return { ok: false, error: 'INVALID_SPOTIFY_URI' };
+    }
+    await phantomSpotifyEngine.playTrack(String(uri));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || 'SPOTIFY_PLAY_FAILED' };
+  }
+});
+
+ipcMain.handle('phantom-spotify-pause', async () => {
+  try {
+    await phantomSpotifyEngine.pauseTrack();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || 'SPOTIFY_PAUSE_FAILED' };
+  }
+});
+
+ipcMain.handle('phantom-spotify-resume', async () => {
+  try {
+    await phantomSpotifyEngine.resumeTrack();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || 'SPOTIFY_RESUME_FAILED' };
+  }
+});
+
+ipcMain.handle('phantom-spotify-logout', async () => {
+  try {
+    phantomToken = null;
+    if (phantomWindow && !phantomWindow.isDestroyed()) {
+      try { phantomWindow.close(); } catch (e) {}
+    }
+    await clearSpotifyLoginSession();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || 'SPOTIFY_LOGOUT_FAILED' };
   }
 });
 
@@ -1402,14 +1448,16 @@ ipcMain.handle('mineradio-wallpaper-update', async (_event, payload) => {
 
 let phantomWindow = null;
 let phantomToken = null;
+let phantomTokenTimer = null;
 
 function createPhantomPlayer() {
-  if (phantomWindow) return;
+  if (phantomWindow && !phantomWindow.isDestroyed()) return phantomWindow;
   phantomWindow = new BrowserWindow({
     width: 800,
     height: 600,
     show: false,
     webPreferences: {
+      partition: SPOTIFY_LOGIN_PARTITION,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -1417,22 +1465,42 @@ function createPhantomPlayer() {
     }
   });
 
-  phantomWindow.loadURL('https://open.spotify.com');
+  phantomWindow.on('closed', () => {
+    phantomWindow = null;
+    phantomToken = null;
+  });
+  phantomWindow.loadURL('https://open.spotify.com').catch(() => {});
 
-  setInterval(async () => {
-    if (!phantomWindow || phantomWindow.isDestroyed()) return;
-    try {
-      const token = await phantomWindow.webContents.executeJavaScript(`
-        new Promise(resolve => {
-          fetch('https://open.spotify.com/get_access_token?reason=transport&productType=web_player')
-            .then(r => r.json())
-            .then(d => resolve(d.accessToken))
-            .catch(() => resolve(null))
-        })
-      `);
-      if (token) phantomToken = token;
-    } catch(e) {}
-  }, 5000);
+  if (!phantomTokenTimer) {
+    phantomTokenTimer = setInterval(() => {
+      refreshPhantomSpotifyToken().catch(() => {});
+    }, 5000);
+  }
+  return phantomWindow;
+}
+
+async function refreshPhantomSpotifyToken() {
+  const win = createPhantomPlayer();
+  if (!win || win.isDestroyed()) return null;
+  try {
+    if (win.webContents.isLoading()) {
+      await new Promise(resolve => {
+        const done = () => resolve();
+        win.webContents.once('did-finish-load', done);
+        setTimeout(done, 3500);
+      });
+    }
+    const token = await win.webContents.executeJavaScript(`
+      new Promise(resolve => {
+        fetch('https://open.spotify.com/get_access_token?reason=transport&productType=web_player')
+          .then(r => r.json())
+          .then(d => resolve(d && d.accessToken ? d.accessToken : null))
+          .catch(() => resolve(null));
+      })
+    `);
+    if (token) phantomToken = token;
+  } catch (e) {}
+  return phantomToken || null;
 }
 
 function openSpotifyLoginWindow(owner) {
@@ -1443,8 +1511,14 @@ function openSpotifyLoginWindow(owner) {
       parent: owner && !owner.isDestroyed() ? owner : undefined,
       modal: true,
       autoHideMenuBar: true,
-      title: 'Spotify Login',
+      title: 'Spotify Secure Sign-In',
       backgroundColor: '#121212',
+      webPreferences: {
+        partition: SPOTIFY_LOGIN_PARTITION,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true
+      }
     });
 
     loginWindow.loadURL('https://accounts.spotify.com/login');

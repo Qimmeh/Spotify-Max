@@ -1,0 +1,1011 @@
+async function handleSearch(keywords, limit) {
+  console.log('[Search]', keywords, 'limit:', limit);
+  const result = await cloudsearch({ keywords, limit, cookie: userCookie });
+  const songs = result.body && result.body.result && result.body.result.songs ? result.body.result.songs : [];
+
+  let mapped = songs.map(s => {
+    return mapSongRecord(s);
+  });
+
+  // 兜底: 补齐缺失的封面
+  const missing = mapped.filter(s => !s.cover).map(s => s.id);
+  if (missing.length) {
+    try {
+      console.log('[Search] backfilling covers for', missing.length, 'songs');
+      const dd = await song_detail({ ids: missing.join(','), cookie: userCookie });
+      const songsArr = (dd.body && dd.body.songs) || [];
+      const idToPic = {};
+      songsArr.forEach(s => {
+        const pic = (s.al && s.al.picUrl) || (s.album && s.album.picUrl) || '';
+        if (pic) idToPic[s.id] = pic;
+      });
+      mapped = mapped.map(s => s.cover ? s : { ...s, cover: idToPic[s.id] || '' });
+    } catch (e) { console.warn('[Search] backfill failed:', e.message); }
+  }
+
+  return mapped;
+}
+
+async function handleDiscoverHome() {
+  const info = await getLoginInfo();
+  const loggedIn = !!(info && info.loggedIn);
+  if (!loggedIn) {
+    return {
+      loggedIn: false,
+      user: null,
+      dailySongs: [],
+      playlists: [],
+      podcasts: [],
+      mode: 'starter',
+      updatedAt: Date.now(),
+    };
+  }
+  const tasks = [
+    personalized({ limit: 8, cookie: userCookie, timestamp: Date.now() }),
+    dj_hot({ limit: 6, offset: 0, cookie: userCookie, timestamp: Date.now() }),
+    recommend_resource({ cookie: userCookie, timestamp: Date.now() }),
+    recommend_songs({ cookie: userCookie, timestamp: Date.now() }),
+  ];
+  const result = await Promise.allSettled(tasks);
+
+  const personalizedBody = result[0].status === 'fulfilled' && result[0].value && result[0].value.body || {};
+  const publicPlaylists = (personalizedBody.result || personalizedBody.data || [])
+    .map(pl => mapDiscoverPlaylist(pl, '推荐歌单'))
+    .filter(pl => pl.id && pl.name)
+    .slice(0, 8);
+
+  const podcastBody = result[1].status === 'fulfilled' && result[1].value && result[1].value.body || {};
+  const podcastRaw = podcastBody.djRadios || podcastBody.djradios || podcastBody.radios || podcastBody.data || [];
+  const podcasts = (Array.isArray(podcastRaw) ? podcastRaw : [])
+    .map(mapPodcastRadio)
+    .filter(p => p.id && !isLowSignalPodcastItem(p))
+    .slice(0, 6);
+
+  let privatePlaylists = [];
+  if (result[2].status === 'fulfilled' && result[2].value) {
+    const body = result[2].value.body || {};
+    const raw = body.recommend || body.data || [];
+    privatePlaylists = (Array.isArray(raw) ? raw : [])
+      .map(pl => mapDiscoverPlaylist(pl, '私人推荐'))
+      .filter(pl => pl.id && pl.name)
+      .slice(0, 6);
+  }
+
+  let dailySongs = [];
+  if (result[3].status === 'fulfilled' && result[3].value) {
+    const body = result[3].value.body || {};
+    const raw = body.data && (body.data.dailySongs || body.data.recommend) || body.recommend || [];
+    dailySongs = (Array.isArray(raw) ? raw : [])
+      .map(mapSongRecord)
+      .filter(song => song.id && song.name)
+      .slice(0, 12);
+  }
+
+  return {
+    loggedIn,
+    user: loggedIn ? { userId: info.userId, nickname: info.nickname || '', avatar: info.avatar || '' } : null,
+    dailySongs,
+    playlists: privatePlaylists.concat(publicPlaylists).slice(0, 10),
+    podcasts,
+    updatedAt: Date.now(),
+  };
+}
+
+const QQ_MUSICU_URL = 'https://u.y.qq.com/cgi-bin/musicu.fcg';
+const QQ_SMARTBOX_URL = 'https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg';
+const QQ_HEADERS = {
+  Referer: 'https://y.qq.com/',
+  'User-Agent': UA,
+};
+
+function requestText(targetUrl, opts, body) {
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(u, {
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+    }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (response.statusCode >= 400) {
+          const err = new Error('HTTP ' + response.statusCode);
+          err.statusCode = response.statusCode;
+          err.body = text;
+          reject(err);
+          return;
+        }
+        resolve(text);
+      });
+    });
+    req.setTimeout(10000, () => req.destroy(new Error('Request timeout')));
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function requestJson(targetUrl, opts, body) {
+  const text = await requestText(targetUrl, opts, body);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const err = new Error('Invalid JSON from ' + targetUrl);
+    err.cause = e;
+    throw err;
+  }
+}
+
+function clampNumber(value, min, max, fallback) {
+  if (value === null || value === undefined || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function openMeteoWeatherLabel(code) {
+  code = Number(code);
+  if (code === 0) return '晴';
+  if (code === 1 || code === 2) return '少云';
+  if (code === 3) return '阴';
+  if (code === 45 || code === 48) return '雾';
+  if (code === 51 || code === 53 || code === 55) return '毛毛雨';
+  if (code === 56 || code === 57) return '冻雨';
+  if (code === 61 || code === 63 || code === 65) return '雨';
+  if (code === 66 || code === 67) return '冻雨';
+  if (code === 71 || code === 73 || code === 75 || code === 77) return '雪';
+  if (code === 80 || code === 81 || code === 82) return '阵雨';
+  if (code === 85 || code === 86) return '阵雪';
+  if (code === 95 || code === 96 || code === 99) return '雷雨';
+  return '天气';
+}
+
+function buildWeatherMood(weather, date) {
+  const now = date || new Date();
+  const hour = now.getHours();
+  const code = Number(weather && weather.weatherCode);
+  const temp = Number(weather && weather.temperature);
+  const apparent = Number(weather && weather.apparentTemperature);
+  const rain = Number(weather && weather.precipitation) || 0;
+  const humidity = Number(weather && weather.humidity) || 0;
+  const wind = Number(weather && weather.windSpeed) || 0;
+  const isNight = weather && weather.isDay === 0 || hour < 6 || hour >= 20;
+  const isMorning = hour >= 5 && hour < 11;
+  const isDusk = hour >= 17 && hour < 20;
+  const isRain = rain > 0 || [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99].includes(code);
+  const isSnow = [71, 73, 75, 77, 85, 86].includes(code);
+  const isCloud = [2, 3, 45, 48].includes(code);
+  const isStorm = [95, 96, 99].includes(code);
+  const feels = Number.isFinite(apparent) ? apparent : temp;
+
+  let mood = {
+    key: 'clear',
+    title: '晴朗电台',
+    tagline: '让节奏亮一点，像窗边的光',
+    energy: 0.62,
+    warmth: 0.58,
+    focus: 0.48,
+    melancholy: 0.24,
+    keywords: ['轻快 华语', 'city pop', 'indie pop', 'chill pop', '阳光 歌单'],
+  };
+  if (isStorm) {
+    mood = {
+      key: 'storm',
+      title: '雷雨电台',
+      tagline: '低频更厚，适合把世界关小一点',
+      energy: 0.46,
+      warmth: 0.34,
+      focus: 0.66,
+      melancholy: 0.62,
+      keywords: ['暗色 R&B', 'trip hop', '夜晚 电子', '氛围 摇滚', '雨夜 歌单'],
+    };
+  } else if (isRain) {
+    mood = {
+      key: 'rain',
+      title: '雨天电台',
+      tagline: '留一点潮湿的空间给旋律',
+      energy: 0.38,
+      warmth: 0.42,
+      focus: 0.64,
+      melancholy: 0.66,
+      keywords: ['雨天 R&B', 'lofi rainy', '华语 慢歌', 'dream pop', '雨夜 歌单'],
+    };
+  } else if (isSnow || feels <= 3) {
+    mood = {
+      key: 'snow',
+      title: '冷空气电台',
+      tagline: '干净、慢速、带一点冬天的颗粒感',
+      energy: 0.34,
+      warmth: 0.28,
+      focus: 0.72,
+      melancholy: 0.54,
+      keywords: ['冬天 民谣', 'ambient piano', '日系 冬天', 'indie folk', '安静 歌单'],
+    };
+  } else if (feels >= 31 || humidity >= 78) {
+    mood = {
+      key: 'humid',
+      title: '闷热电台',
+      tagline: '降低密度，留出一点呼吸',
+      energy: 0.48,
+      warmth: 0.76,
+      focus: 0.46,
+      melancholy: 0.30,
+      keywords: ['夏日 chill', 'bossa nova', 'city pop 夏天', '轻电子', '海边 歌单'],
+    };
+  } else if (isCloud) {
+    mood = {
+      key: 'cloudy',
+      title: '阴天电台',
+      tagline: '不急着明亮，先让声音变软',
+      energy: 0.40,
+      warmth: 0.46,
+      focus: 0.58,
+      melancholy: 0.52,
+      keywords: ['阴天 华语', 'indie rock mellow', 'neo soul', 'chillhop', '独立 民谣'],
+    };
+  }
+
+  if (isNight) {
+    mood.key += '-night';
+    mood.title = mood.key.startsWith('clear') ? '夜色电台' : mood.title.replace('电台', '夜听');
+    mood.tagline = '音量放低一点，让夜色参与编曲';
+    mood.energy = Math.min(mood.energy, 0.42);
+    mood.focus = Math.max(mood.focus, 0.68);
+    mood.melancholy = Math.max(mood.melancholy, 0.52);
+    mood.keywords = ['夜晚 R&B', 'late night jazz', 'ambient', 'lofi sleep', '夜跑 歌单'].concat(mood.keywords.slice(0, 3));
+  } else if (isMorning) {
+    mood.title = mood.key.startsWith('rain') ? '雨晨电台' : '早晨电台';
+    mood.energy = Math.max(mood.energy, 0.52);
+    mood.keywords = ['早晨 通勤', 'morning acoustic', '清晨 indie', '轻快 华语'].concat(mood.keywords.slice(0, 3));
+  } else if (isDusk) {
+    mood.title = mood.key.startsWith('rain') ? '黄昏雨声' : '黄昏电台';
+    mood.melancholy = Math.max(mood.melancholy, 0.48);
+    mood.keywords = ['黄昏 city pop', '日落 歌单', '落日飞车', 'soul pop'].concat(mood.keywords.slice(0, 3));
+  }
+
+  if (wind >= 28) {
+    mood.energy = Math.max(mood.energy, 0.56);
+    mood.keywords = ['公路 摇滚', 'windy day playlist'].concat(mood.keywords.slice(0, 4));
+  }
+  mood.keywords = Array.from(new Set(mood.keywords)).slice(0, 7);
+  return mood;
+}
+
+async function resolveOpenMeteoLocation(query) {
+  const raw = String(query || '').trim();
+  if (!raw) return WEATHER_DEFAULT_LOCATION;
+  const u = new URL(OPEN_METEO_GEOCODE_URL);
+  u.searchParams.set('name', raw);
+  u.searchParams.set('count', '1');
+  u.searchParams.set('language', 'zh');
+  u.searchParams.set('format', 'json');
+  const body = await requestJson(u.toString(), { headers: { 'User-Agent': UA } });
+  const first = body && Array.isArray(body.results) && body.results[0];
+  if (!first) return { ...WEATHER_DEFAULT_LOCATION, query: raw, fallback: true };
+  return {
+    name: first.name || raw,
+    country: first.country || '',
+    admin1: first.admin1 || '',
+    latitude: first.latitude,
+    longitude: first.longitude,
+    timezone: first.timezone || 'auto',
+  };
+}
+
+async function fetchOpenMeteoWeather(params) {
+  params = params || {};
+  let location;
+  const lat = clampNumber(params.lat, -90, 90, NaN);
+  const lon = clampNumber(params.lon, -180, 180, NaN);
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    location = {
+      name: String(params.city || params.name || '当前位置').trim() || '当前位置',
+      country: '',
+      latitude: lat,
+      longitude: lon,
+      timezone: params.timezone || 'auto',
+    };
+  } else {
+    location = await resolveOpenMeteoLocation(params.city || params.q || params.location);
+  }
+  const u = new URL(OPEN_METEO_FORECAST_URL);
+  u.searchParams.set('latitude', String(location.latitude));
+  u.searchParams.set('longitude', String(location.longitude));
+  u.searchParams.set('current', 'temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,rain,showers,snowfall,weather_code,cloud_cover,wind_speed_10m,wind_gusts_10m');
+  u.searchParams.set('hourly', 'precipitation_probability,weather_code,temperature_2m');
+  u.searchParams.set('forecast_days', '1');
+  u.searchParams.set('timezone', location.timezone || 'auto');
+  const body = await requestJson(u.toString(), { headers: { 'User-Agent': UA } });
+  const cur = body && body.current || {};
+  const weather = {
+    provider: 'open-meteo',
+    location: {
+      name: location.name,
+      country: location.country || '',
+      admin1: location.admin1 || '',
+      latitude: location.latitude,
+      longitude: location.longitude,
+      timezone: body.timezone || location.timezone || '',
+      fallback: !!location.fallback,
+    },
+    label: openMeteoWeatherLabel(cur.weather_code),
+    weatherCode: Number(cur.weather_code),
+    temperature: Number(cur.temperature_2m),
+    apparentTemperature: Number(cur.apparent_temperature),
+    humidity: Number(cur.relative_humidity_2m),
+    precipitation: Number(cur.precipitation || cur.rain || cur.showers || cur.snowfall || 0),
+    cloudCover: Number(cur.cloud_cover),
+    windSpeed: Number(cur.wind_speed_10m),
+    windGusts: Number(cur.wind_gusts_10m),
+    isDay: Number(cur.is_day),
+    time: cur.time || '',
+    updatedAt: Date.now(),
+  };
+  weather.mood = buildWeatherMood(weather);
+  return weather;
+}
+
+async function fetchIpWeatherLocation() {
+  const u = new URL(WEATHER_IP_LOCATION_URL);
+  u.searchParams.set('fields', 'status,message,country,regionName,city,lat,lon,timezone,query');
+  u.searchParams.set('lang', 'zh-CN');
+  const body = await requestJson(u.toString(), { headers: { 'User-Agent': UA } });
+  if (!body || body.status !== 'success' || !Number.isFinite(Number(body.lat)) || !Number.isFinite(Number(body.lon))) {
+    const err = new Error(body && body.message || 'IP_LOCATION_FAILED');
+    err.body = body;
+    throw err;
+  }
+  return {
+    provider: 'ip-api',
+    city: body.city || WEATHER_DEFAULT_LOCATION.name,
+    region: body.regionName || '',
+    country: body.country || '',
+    latitude: Number(body.lat),
+    longitude: Number(body.lon),
+    timezone: body.timezone || 'auto',
+    ip: body.query || '',
+  };
+}
+
+function weatherRadioSeedQueries(mood) {
+  const key = String(mood && mood.key || '');
+  if (key.includes('rain') || key.includes('storm')) return ['陈奕迅 阴天快乐', '周杰伦 雨下一整晚', '孙燕姿 遇见', '林宥嘉 说谎', '毛不易 消愁'];
+  if (key.includes('snow') || key.includes('cloudy')) return ['陈奕迅 好久不见', '莫文蔚 阴天', '李健 贝加尔湖畔', '朴树 平凡之路', '蔡健雅 达尔文'];
+  if (key.includes('humid')) return ['落日飞车 My Jinji', '告五人 爱人错过', '夏日入侵企画 想去海边', '陈绮贞 旅行的意义', '王若琳 Lost in Paradise'];
+  if (key.includes('night')) return ['方大同 特别的人', '陶喆 爱很简单', 'Frank Ocean Pink + White', '林忆莲 夜太黑', "Norah Jones Don't Know Why"];
+  return ['孙燕姿 天黑黑', '周杰伦 晴天', '五月天 温柔', '陈奕迅 稳稳的幸福', '王菲'];
+}
+
+function fallbackWeatherForRadio(params, err) {
+  params = params || {};
+  const name = String(params.city || params.q || params.location || WEATHER_DEFAULT_LOCATION.name).trim() || WEATHER_DEFAULT_LOCATION.name;
+  return {
+    provider: 'open-meteo',
+    location: {
+      name,
+      country: '',
+      admin1: '',
+      latitude: null,
+      longitude: null,
+      timezone: params.timezone || WEATHER_DEFAULT_LOCATION.timezone,
+      fallback: true,
+    },
+    label: '天气暂不可用',
+    weatherCode: null,
+    temperature: null,
+    apparentTemperature: null,
+    humidity: null,
+    precipitation: null,
+    cloudCover: null,
+    windSpeed: null,
+    windGusts: null,
+    isDay: null,
+    time: '',
+    updatedAt: Date.now(),
+    error: err && err.message || '',
+    mood: {
+      key: 'fallback',
+      title: '临时电台',
+      tagline: '天气暂时没有回来，先放一组稳妥的歌',
+      energy: 0.54,
+      warmth: 0.55,
+      focus: 0.55,
+      melancholy: 0.35,
+      keywords: ['华语 流行', 'indie pop', 'city pop', '轻快 歌单', 'chill pop'],
+    },
+  };
+}
+
+function uniqueSongsByKey(songs) {
+  const seen = new Set();
+  const out = [];
+  (songs || []).forEach(song => {
+    const key = String(song && (song.id || song.name + '|' + song.artist) || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(song);
+  });
+  return out;
+}
+
+function tagWeatherPoolSongs(songs, source) {
+  return (songs || []).map(song => ({ ...song, weatherSource: source }));
+}
+
+async function fetchWeatherPlaylistSongs(playlist, limit) {
+  const id = playlist && playlist.id;
+  if (!id) return [];
+  let rawTracks = [];
+  try {
+    if (typeof playlist_track_all === 'function') {
+      const all = await playlist_track_all({ id, limit: limit || 36, offset: 0, cookie: userCookie, timestamp: Date.now() });
+      rawTracks = (all.body && (all.body.songs || all.body.tracks)) || [];
+    }
+  } catch (e) {
+    console.warn('[WeatherRadio] playlist_track_all failed:', playlist && playlist.name, e.message);
+  }
+  if (!rawTracks.length && typeof playlist_detail === 'function') {
+    try {
+      const detail = await playlist_detail({ id, s: 0, cookie: userCookie, timestamp: Date.now() });
+      const pl = (detail.body && detail.body.playlist) || {};
+      rawTracks = pl.tracks || [];
+    } catch (e) {
+      console.warn('[WeatherRadio] playlist_detail failed:', playlist && playlist.name, e.message);
+    }
+  }
+  return rawTracks.map(mapSongRecord).filter(song => song.id && song.name).slice(0, limit || 36);
+}
+
+async function filterLikelyPlayableWeatherSongs(songs) {
+  const source = uniqueSongsByKey(songs)
+    .filter(song => song && song.name && song.id && !isLowSignalWeatherSong(song))
+    .slice(0, 24);
+  const playable = [];
+  const fallback = source.slice(0, 24);
+  for (let i = 0; i < source.length; i += 4) {
+    const chunk = source.slice(i, i + 4);
+    const settled = await Promise.allSettled(chunk.map(async song => {
+      const info = await handleSongUrl(song.id, { loggedIn: !!userCookie }, 'standard');
+      return info && info.url ? song : null;
+    }));
+    settled.forEach((result, idx) => {
+      if (result.status === 'fulfilled' && result.value) playable.push(result.value);
+      else if (result.status === 'rejected') console.warn('[WeatherRadio] playable probe failed:', chunk[idx] && chunk[idx].name, result.reason && result.reason.message);
+    });
+    if (playable.length >= 12) break;
+  }
+  return (playable.length ? playable : fallback).slice(0, 24);
+}
+
+function isLowSignalWeatherSong(song) {
+  const text = String([
+    song && song.name,
+    song && song.artist,
+    song && song.album,
+  ].filter(Boolean).join(' ')).toLowerCase();
+  if (!text) return true;
+  if (/(^|[\s\-_/（(])ai(?:\s*(歌|歌曲|音乐|cover|翻唱|生成|作曲|演唱|女声|男声)|$|[\s\-_/）)])/i.test(text)) return true;
+  if (/suno|udio|人工智能|生成歌曲|ai歌曲|虚拟歌手|测试音频|demo|beat\s*maker/i.test(text)) return true;
+  if (/翻自|翻唱|cover|remix|伴奏|纯音乐|钢琴|dj|live\s*版|live版|唯美钢琴|karaoke|instrumental/i.test(text)) return true;
+  if (/白噪音|雨声|睡眠|助眠|冥想|疗愈频率|环境音|自然声音|asmr/i.test(text)) return true;
+  if (/[（(](r&b|lofi|jazz|dj|edm|trap|remix|伴奏|纯音乐|钢琴|电子|治愈|古风|女声|男声|英文|中文版|抖音|ai)[）)]/i.test(text)) return true;
+  if (/^(纯音乐|轻音乐|治愈系|放松|睡眠|雨天|阴天|夜晚|夏日|海边)$/i.test(String(song.name || '').trim())) return true;
+  return false;
+}
+
+function scoreWeatherSong(song, mood) {
+  const text = String((song && song.name || '') + ' ' + (song && song.artist || '') + ' ' + (song && song.album || '')).toLowerCase();
+  let score = 0;
+  if (song && song.cover) score += 4;
+  if (song && song.duration) score += 2;
+  if (song && song.weatherSource === 'daily') score += 6;
+  if (song && song.weatherSource === 'private') score += 4;
+  if (/周杰伦|陈奕迅|孙燕姿|五月天|王菲|陶喆|方大同|林宥嘉|蔡健雅|莫文蔚|李健|毛不易|告五人|落日飞车|陈绮贞|朴树/.test(text)) score += 10;
+  const key = String(mood && mood.key || '');
+  if (key.includes('rain') && /雨|阴|夜|慢|r&b|soul|陈奕迅|林宥嘉|孙燕姿/.test(text)) score += 5;
+  if (key.includes('humid') && /夏|海|city|pop|落日|告五人|方大同|陶喆/.test(text)) score += 5;
+  if (key.includes('night') && /夜|moon|jazz|soul|r&b|方大同|陶喆|王菲/.test(text)) score += 5;
+  if (key.includes('cloudy') && /阴|民谣|indie|陈绮贞|朴树|李健/.test(text)) score += 5;
+  return score;
+}
+
+function weatherArtistKey(song) {
+  const raw = String(song && song.artist || song && song.name || '').split(/\s*\/\s*|、|,|&/)[0] || '';
+  return raw.trim().toLowerCase() || 'unknown';
+}
+
+function weatherTitleKey(song) {
+  return String(song && song.name || '')
+    .toLowerCase()
+    .replace(/[（(][^）)]*[）)]/g, '')
+    .replace(/[\s._\-·'’"“”「」《》:：/\\|]+/g, '')
+    .trim();
+}
+
+function uniqueWeatherTitles(sorted) {
+  const seen = new Set();
+  const out = [];
+  (sorted || []).forEach(song => {
+    const key = weatherTitleKey(song);
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    out.push(song);
+  });
+  return out;
+}
+
+function diversifyWeatherSongs(sorted, artistLimit) {
+  const primary = [];
+  const deferred = [];
+  const counts = new Map();
+  (sorted || []).forEach(song => {
+    const key = weatherArtistKey(song);
+    const count = counts.get(key) || 0;
+    if (count < artistLimit) {
+      primary.push(song);
+      counts.set(key, count + 1);
+    } else {
+      deferred.push(song);
+    }
+  });
+  return primary.length >= 8 ? primary : primary.concat(deferred.slice(0, 8 - primary.length));
+}
+
+function orderWeatherSongs(songs, mood) {
+  const sorted = uniqueSongsByKey(songs)
+    .filter(song => song && song.name && song.id && !isLowSignalWeatherSong(song))
+    .sort((a, b) => scoreWeatherSong(b, mood) - scoreWeatherSong(a, mood));
+  return diversifyWeatherSongs(uniqueWeatherTitles(sorted), 2);
+}
+
+async function buildWeatherRadio(params) {
+  let weather;
+  try {
+    weather = await fetchOpenMeteoWeather(params);
+  } catch (e) {
+    console.warn('[WeatherRadio] weather provider failed, using fallback radio:', e.message);
+    weather = fallbackWeatherForRadio(params, e);
+  }
+  const queries = weatherRadioSeedQueries(weather.mood);
+  let songs = [];
+  const settled = await Promise.allSettled(queries.slice(0, 4).map(q => handleSearch(q, 6)));
+  settled.forEach(result => {
+    if (result.status === 'fulfilled' && Array.isArray(result.value)) songs = songs.concat(result.value);
+  });
+  if (songs.length < 10 && weather.mood && Array.isArray(weather.mood.keywords)) {
+    const more = await Promise.allSettled(weather.mood.keywords.slice(0, 2).map(q => handleSearch(q, 6)));
+    more.forEach(result => {
+      if (result.status === 'fulfilled' && Array.isArray(result.value)) songs = songs.concat(result.value);
+    });
+  }
+  songs = orderWeatherSongs(songs, weather.mood);
+  return {
+    ok: true,
+    weather,
+    radio: {
+      title: weather.mood.title,
+      subtitle: weather.mood.tagline,
+      seedQueries: queries.slice(0, 4),
+      songs: songs.slice(0, 18),
+      updatedAt: Date.now(),
+    },
+  };
+}
+
+function parseJSONText(text) {
+  const raw = String(text || '').trim();
+  const json = raw.replace(/^callback\(([\s\S]*)\);?$/, '$1');
+  return JSON.parse(json);
+}
+
+async function qqMusicRequest(payload, opts) {
+  opts = opts || {};
+  const body = JSON.stringify(payload);
+  const headers = {
+    ...QQ_HEADERS,
+    'Content-Type': 'application/json;charset=UTF-8',
+    'Content-Length': Buffer.byteLength(body),
+  };
+  if (opts.cookie && qqCookie) headers.Cookie = qqCookie;
+  const text = await requestText(QQ_MUSICU_URL, {
+    method: 'POST',
+    headers,
+  }, body);
+  return parseJSONText(text);
+}
+
+function normalizeQQProfile(body, cookieObj) {
+  cookieObj = cookieObj || qqCookieObject();
+  const uin = qqCookieUin(cookieObj);
+  const data = (body && (body.data || body.profile || body.creator || body.result)) || {};
+  const creator = (data.creator || data.user || data.profile || data) || {};
+  const vipInfo = data.vipInfo || data.vipinfo || data.vip || creator.vipInfo || creator.vipinfo || {};
+  const profileNick = creator.nick || creator.nickname || creator.name || creator.hostname || creator.title || '';
+  const profileAvatar = creator.headpic || creator.avatar || creator.avatarUrl || creator.logo || '';
+  const cookieNick = qqCookieNickname(cookieObj, uin);
+  const nick = profileNick || cookieNick || '';
+  const avatar = profileAvatar || qqCookieAvatar(cookieObj, uin);
+  let vipType = Number(
+    cookieObj.vipType || cookieObj.vip_type ||
+    data.vipType || data.vip_type || data.viptype || data.music_vip_level || data.green_vip_level || data.luxury_vip_level ||
+    creator.vipType || creator.vip_type || creator.music_vip_level || creator.green_vip_level || creator.luxury_vip_level ||
+    vipInfo.vipType || vipInfo.vip_type || vipInfo.music_vip_level || vipInfo.green_vip_level || vipInfo.luxury_vip_level || 0
+  ) || 0;
+  if (!vipType) {
+    const vipFlag = data.isVip || data.is_vip || data.vipFlag || data.vipflag || creator.isVip || creator.is_vip || vipInfo.isVip || vipInfo.is_vip || vipInfo.vipFlag;
+    if (vipFlag === true || Number(vipFlag) > 0 || String(vipFlag || '').toLowerCase() === 'true') vipType = 1;
+  }
+  return {
+    provider: 'qq',
+    loggedIn: !!(uin && qqCookieMusicKey(cookieObj)),
+    preview: false,
+    userId: uin,
+    nickname: nick || (uin ? ('QQ ' + uin) : 'QQ 音乐'),
+    avatar,
+    vipType,
+    hasCookie: !!qqCookie,
+    playbackKeyReady: !!qqCookiePlaybackKey(cookieObj),
+    profileSource: profileNick || profileAvatar ? 'qq-profile' : (cookieNick || avatar ? 'cookie' : 'fallback'),
+  };
+}
+
+async function getQQLoginInfo() {
+  const cookieObj = qqCookieObject();
+  const uin = qqCookieUin(cookieObj);
+  const musicKey = qqCookieMusicKey(cookieObj);
+  if (!uin || !musicKey) return { provider: 'qq', loggedIn: false, hasCookie: !!qqCookie };
+  const fallback = normalizeQQProfile(null, cookieObj);
+  try {
+    const u = new URL('https://c.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg');
+    u.searchParams.set('cid', '205360838');
+    u.searchParams.set('userid', uin);
+    u.searchParams.set('reqfrom', '1');
+    u.searchParams.set('g_tk', '5381');
+    u.searchParams.set('loginUin', uin);
+    u.searchParams.set('hostUin', '0');
+    u.searchParams.set('format', 'json');
+    u.searchParams.set('inCharset', 'utf8');
+    u.searchParams.set('outCharset', 'utf-8');
+    u.searchParams.set('notice', '0');
+    u.searchParams.set('platform', 'yqq.json');
+    u.searchParams.set('needNewCode', '0');
+    const text = await requestText(u.toString(), {
+      headers: { ...QQ_HEADERS, Cookie: qqCookie },
+    });
+    const body = parseJSONText(text);
+    const info = normalizeQQProfile(body, cookieObj);
+    if (body && (body.code === 1000 || body.result === 301)) {
+      return { ...fallback, profileUnavailable: true };
+    }
+    return info;
+  } catch (e) {
+    console.warn('[QQLogin] profile check failed:', e.message);
+    return { ...fallback, profileUnavailable: true };
+  }
+}
+
+async function qqGetJSON(targetUrl, params, opts) {
+  opts = opts || {};
+  const u = new URL(targetUrl);
+  Object.keys(params || {}).forEach(k => {
+    if (params[k] != null) u.searchParams.set(k, String(params[k]));
+  });
+  const headers = { ...QQ_HEADERS, ...(opts.headers || {}) };
+  if (opts.cookie !== false && qqCookie) headers.Cookie = qqCookie;
+  const text = await requestText(u.toString(), { headers });
+  return parseJSONText(text);
+}
+
+function audioProxyHeadersFor(audioUrl, range) {
+  const headers = { 'User-Agent': UA, Referer: 'https://music.163.com/' };
+  try {
+    const host = new URL(audioUrl).hostname.toLowerCase();
+    if (host.includes('qq.com') || host.includes('qpic.cn')) headers.Referer = 'https://y.qq.com/';
+  } catch (e) {}
+  if (range) headers.Range = range;
+  return headers;
+}
+
+function audioContentTypeForUrl(audioUrl, upstreamType) {
+  let pathname = '';
+  try { pathname = new URL(audioUrl).pathname.toLowerCase(); } catch (e) {}
+  if (/\.flac$/.test(pathname)) return 'audio/flac';
+  if (/\.mp3$/.test(pathname)) return 'audio/mpeg';
+  if (/\.(m4a|mp4)$/.test(pathname)) return 'audio/mp4';
+  if (/\.ogg$/.test(pathname)) return 'audio/ogg';
+  if (/\.wav$/.test(pathname)) return 'audio/wav';
+  return upstreamType || 'audio/mpeg';
+}
+
+function mapQQPlaylist(pl, kind) {
+  pl = pl || {};
+  const id = pl.dissid || pl.tid || pl.dirid || pl.id || pl.diss_id;
+  return {
+    provider: 'qq',
+    source: 'qq',
+    id: id ? String(id) : '',
+    name: pl.diss_name || pl.name || pl.title || '',
+    cover: pl.diss_cover || pl.logo || pl.picurl || pl.cover || '',
+    trackCount: pl.song_cnt || pl.songnum || pl.total_song_num || pl.song_count || 0,
+    playCount: pl.listen_num || pl.visitnum || pl.play_count || 0,
+    creator: pl.hostname || pl.nick || pl.creator || 'QQ 音乐',
+    subscribed: kind === 'collect',
+    specialType: 0,
+  };
+}
+
+function mapQQPlaylistTrack(raw) {
+  raw = raw || {};
+  const track = raw.songid || raw.songmid || raw.mid || raw.name ? raw : (raw.track_info || raw.songInfo || raw.songinfo || raw.song || {});
+  const album = track.album || {};
+  const artists = mapQQArtists(track.singer || track.singers || []);
+  const mid = track.mid || track.songmid || raw.mid || raw.songmid || '';
+  const albumMid = album.mid || track.albummid || raw.albummid || '';
+  return {
+    provider: 'qq',
+    source: 'qq',
+    type: 'qq',
+    id: mid || String(track.id || track.songid || raw.id || raw.songid || ''),
+    qqId: track.id || track.songid || raw.id || raw.songid || '',
+    mid,
+    songmid: mid,
+    mediaMid: (track.file && track.file.media_mid) || track.strMediaMid || track.media_mid || raw.strMediaMid || '',
+    name: track.name || track.songname || raw.songname || '',
+    artist: artists.map(a => a.name).join(' / ') || track.singername || raw.singername || '',
+    artists,
+    artistId: artists[0] && (artists[0].id || artists[0].mid),
+    artistMid: artists[0] && artists[0].mid,
+    album: album.name || album.title || track.albumname || raw.albumname || '',
+    albumMid,
+    cover: qqAlbumCover(albumMid, 300),
+    duration: (Number(track.interval || raw.interval) || 0) * 1000,
+    fee: track.pay && Number(track.pay.pay_play) ? 1 : 0,
+    playable: false,
+  };
+}
+
+async function handleQQUserPlaylists() {
+  const info = await getQQLoginInfo();
+  if (!info.loggedIn || !info.userId) return { loggedIn: false, provider: 'qq', playlists: [] };
+  const uin = info.userId;
+  const createdReq = qqGetJSON('https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss', {
+    hostUin: 0,
+    hostuin: uin,
+    sin: 0,
+    size: 200,
+    g_tk: 5381,
+    loginUin: uin,
+    format: 'json',
+    inCharset: 'utf8',
+    outCharset: 'utf-8',
+    notice: 0,
+    platform: 'yqq.json',
+    needNewCode: 0,
+  }, { headers: { Referer: 'https://y.qq.com/portal/profile.html' } });
+  const collectReq = qqGetJSON('https://c.y.qq.com/fav/fcgi-bin/fcg_get_profile_order_asset.fcg', {
+    ct: 20,
+    cid: 205360956,
+    userid: uin,
+    reqtype: 3,
+    sin: 0,
+    ein: 80,
+  }, { headers: { Referer: 'https://y.qq.com/portal/profile.html' } });
+  const [createdRaw, collectRaw] = await Promise.allSettled([createdReq, collectReq]);
+  const created = createdRaw.status === 'fulfilled' && createdRaw.value && createdRaw.value.data && Array.isArray(createdRaw.value.data.disslist)
+    ? createdRaw.value.data.disslist.map(pl => mapQQPlaylist(pl, 'created')) : [];
+  const collected = collectRaw.status === 'fulfilled' && collectRaw.value && collectRaw.value.data && Array.isArray(collectRaw.value.data.cdlist)
+    ? collectRaw.value.data.cdlist.map(pl => mapQQPlaylist(pl, 'collect')) : [];
+  const seen = new Set();
+  const playlists = created.concat(collected).filter(pl => {
+    if (!pl.id || !pl.name || seen.has(pl.id)) return false;
+    if (isQzoneBackgroundPlaylist(pl)) return false;
+    seen.add(pl.id);
+    return true;
+  }).sort((a, b) => Number(isQQFavoritePlaylist(b)) - Number(isQQFavoritePlaylist(a)));
+  return { loggedIn: true, provider: 'qq', userId: uin, playlists };
+}
+
+async function handleQQPlaylistTracks(id) {
+  const info = await getQQLoginInfo();
+  if (!info.loggedIn || !info.userId) return { loggedIn: false, provider: 'qq', tracks: [] };
+  const pid = String(id || '').trim();
+  if (!pid) return { loggedIn: true, provider: 'qq', error: 'Missing QQ playlist id', tracks: [] };
+  const result = await qqGetJSON('https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg', {
+    type: 1,
+    utf8: 1,
+    disstid: pid,
+    loginUin: info.userId,
+    format: 'json',
+    inCharset: 'utf8',
+    outCharset: 'utf-8',
+    notice: 0,
+    platform: 'yqq.json',
+    needNewCode: 0,
+  }, { headers: { Referer: 'https://y.qq.com/n/yqq/playlist' } });
+  const detail = result && result.cdlist && result.cdlist[0] ? result.cdlist[0] : {};
+  const rawTracks = Array.isArray(detail.songlist) ? detail.songlist : [];
+  const tracks = rawTracks.map(mapQQPlaylistTrack).filter(s => s.name && (s.mid || s.id));
+  const playlist = {
+    provider: 'qq',
+    id: pid,
+    name: detail.dissname || detail.diss_name || detail.name || '',
+    cover: detail.logo || detail.diss_cover || '',
+    trackCount: tracks.length,
+  };
+  return { loggedIn: true, provider: 'qq', playlist, tracks };
+}
+
+function qqAlbumCover(albumMid, size) {
+  if (!albumMid) return '';
+  const px = size || 300;
+  return 'https://y.qq.com/music/photo_new/T002R' + px + 'x' + px + 'M000' + albumMid + '.jpg?max_age=2592000';
+}
+
+function qqSingerAvatar(singerMid, size) {
+  if (!singerMid) return '';
+  const px = size || 300;
+  return 'https://y.qq.com/music/photo_new/T001R' + px + 'x' + px + 'M000' + singerMid + '.jpg?max_age=2592000';
+}
+
+function mapQQArtists(raw) {
+  return (raw || [])
+    .map(a => ({
+      id: a && a.id,
+      mid: a && a.mid,
+      name: (a && (a.name || a.title)) || '',
+    }))
+    .filter(a => a.name);
+}
+
+function mapQQSmartSong(item) {
+  item = item || {};
+  const mid = item.mid || item.songmid || item.id || '';
+  return {
+    provider: 'qq',
+    source: 'qq',
+    type: 'qq',
+    id: mid,
+    qqId: item.id || item.docid || '',
+    mid,
+    songmid: mid,
+    name: item.name || item.title || '',
+    artist: item.singer || '',
+    artists: item.singer ? [{ name: item.singer }] : [],
+    album: '',
+    cover: '',
+    duration: 0,
+    fee: 0,
+    playable: false,
+  };
+}
+
+function mapQQTrack(track, fallback) {
+  track = track || {};
+  fallback = fallback || {};
+  const album = track.album || {};
+  const artists = mapQQArtists(track.singer || []);
+  const mid = track.mid || fallback.mid || fallback.songmid || '';
+  const albumMid = album.mid || album.pmid || '';
+  return {
+    provider: 'qq',
+    source: 'qq',
+    type: 'qq',
+    id: mid,
+    qqId: track.id || fallback.qqId || fallback.id || '',
+    mid,
+    songmid: mid,
+    mediaMid: track.file && track.file.media_mid,
+    name: track.name || track.title || fallback.name || '',
+    artist: artists.map(a => a.name).join(' / ') || fallback.artist || '',
+    artists: artists.length ? artists : (fallback.artists || []),
+    artistId: artists[0] && (artists[0].id || artists[0].mid),
+    artistMid: artists[0] && artists[0].mid,
+    album: album.name || album.title || fallback.album || '',
+    albumMid,
+    cover: qqAlbumCover(albumMid, 300) || fallback.cover || '',
+    duration: (Number(track.interval) || 0) * 1000,
+    fee: track.pay && Number(track.pay.pay_play) ? 1 : 0,
+    playable: false,
+  };
+}
+
+async function qqSmartboxSearch(keywords, limit) {
+  const u = new URL(QQ_SMARTBOX_URL);
+  u.searchParams.set('format', 'json');
+  u.searchParams.set('key', keywords);
+  u.searchParams.set('g_tk', '5381');
+  u.searchParams.set('loginUin', '0');
+  u.searchParams.set('hostUin', '0');
+  u.searchParams.set('inCharset', 'utf8');
+  u.searchParams.set('outCharset', 'utf-8');
+  u.searchParams.set('notice', '0');
+  u.searchParams.set('platform', 'yqq.json');
+  u.searchParams.set('needNewCode', '0');
+  const text = await requestText(u.toString(), { headers: QQ_HEADERS });
+  const json = parseJSONText(text);
+  const items = json && json.data && json.data.song && json.data.song.itemlist;
+  return (Array.isArray(items) ? items : []).slice(0, Math.max(1, Math.min(limit || 6, 10))).map(mapQQSmartSong);
+}
+
+async function qqSongDetail(mid, fallback) {
+  if (!mid) return fallback;
+  const json = await qqMusicRequest({
+    comm: { ct: 24, cv: 0 },
+    songinfo: {
+      module: 'music.pf_song_detail_svr',
+      method: 'get_song_detail_yqq',
+      param: { song_mid: mid },
+    },
+  });
+  const data = json && json.songinfo && json.songinfo.data;
+  return mapQQTrack(data && data.track_info, fallback);
+}
+
+async function handleQQArtistDetail(mid, limit) {
+  const singerMid = String(mid || '').trim();
+  const num = Math.max(10, Math.min(80, parseInt(limit || '36', 10) || 36));
+  if (!singerMid) return { provider: 'qq', error: 'MISSING_SINGER_MID', artist: null, songs: [] };
+  const json = await qqMusicRequest({
+    comm: { ct: 24, cv: 0 },
+    singer: {
+      module: 'music.web_singer_info_svr',
+      method: 'get_singer_detail_info',
+      param: { sort: 5, singermid: singerMid, sin: 0, num },
+    },
+  }, { cookie: true });
+  const block = json && json.singer;
+  if (!block || Number(block.code || 0) !== 0) {
+    return { provider: 'qq', error: block && (block.message || block.msg || block.code) || 'QQ_ARTIST_DETAIL_FAILED', artist: null, songs: [] };
+  }
+  const data = block.data || {};
+  const info = data.singer_info || data.singerInfo || {};
+  const rawSongs = Array.isArray(data.songlist) ? data.songlist : [];
+  const songs = rawSongs
+    .map(raw => mapQQTrack(raw && (raw.track_info || raw.songInfo || raw.songinfo || raw.song) || raw, {}))
+    .filter(song => song && song.name && (song.mid || song.id));
+  const matchedSongArtist = songs[0] && (songs[0].artists || []).find(a => a && a.mid === singerMid);
+  const artistMid = info.mid || singerMid;
+  const artistName = info.name || info.title || (matchedSongArtist && matchedSongArtist.name) || '';
+  const totalSong = Number(data.total_song || data.song_count || 0) || songs.length;
+  return {
+    provider: 'qq',
+    artist: {
+      provider: 'qq',
+      id: info.id || '',
+      mid: artistMid,
+      name: artistName,
+      avatar: info.pic || info.avatar || qqSingerAvatar(artistMid, 300),
+      fans: Number(info.fans || 0) || 0,
+      musicSize: totalSong,
+      albumSize: Number(data.total_album || 0) || 0,
+      mvSize: Number(data.total_mv || 0) || 0,
+    },
+    total: totalSong,
+    songs,
+  };
+}
+
+async function handleQQSearch(keywords, limit) {
+  const kw = String(keywords || '').trim();
+  if (!kw) return [];
+  console.log('[QQSearch]', kw, 'limit:', limit);
+  const base = await qqSmartboxSearch(kw, limit);
+  const detailed = await Promise.all(base.map(async item => {
+    try { return await qqSongDetail(item.mid, item); }
+    catch (e) {
+      console.warn('[QQSearch] detail failed:', item.mid, e.message);
+      return item;
+    }
+  }));
+  const seen = new Set();
+  return detailed.filter(song => {
+    const key = song && (song.mid || song.id || (song.name + '|' + song.artist));
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return !!song.name;
+  });
+}
+

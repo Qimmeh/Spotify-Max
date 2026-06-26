@@ -1,0 +1,56 @@
+﻿
+>   if (pn === '/api/spotify/credentials') {
+      if (req.method === 'POST') {
+        try {
+          const body = await readRequestBody(req);
+          saveSpotifyCredentials(body.clientId || '', body.clientSecret || '');
+          sendJSON(res, { ok: true, credentials: { clientId: spotifyCredentials.clientId, hasSecret: 
+!!spotifyCredentials.clientSecret } });
+        } catch (err) {
+          sendJSON(res, { error: err.message }, 500);
+        }
+      } else {
+        sendJSON(res, {
+          credentials: {
+            clientId: spotifyCredentials.clientId,
+            hasSecret: !!spotifyCredentials.clientSecret
+          },
+          redirectUri: `http://127.0.0.1:${PORT}/api/spotify/login/callback`
+        });
+      }
+      return;
+    }
+  
+    // ---------- Spotify Auth Callback ----------
+    if (pn === '/api/spotify/login/callback') {
+      try {
+        const code = url.searchParams.get('code') || '';
+        if (!code) throw new Error('Authorization code missing');
+        const port = PORT || 3000;
+        const redirectUri = `http://127.0.0.1:${port}/api/spotify/login/callback`;
+        const authStr = 
+Buffer.from(`${spotifyCredentials.clientId}:${spotifyCredentials.clientSecret}`).toString('base64');
+        const tokenRes = await safeFetch('https://accounts.spotify.com/api/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${authStr}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`
+        });
+        if (!tokenRes.ok) {
+          const text = await tokenRes.text();
+          throw new Error(`Token exchange failed: ${text}`);
+        }
+        const data = await tokenRes.json();
+        saveSpotifyToken({
+          access_token: data.access_token,
+          refresh_token: data.refresh_token,
+          expires_at: Date.now() + (data.expires_in * 1000) - 60000,
+          scope: data.scope
+        });
+        res.writeHead(200, { 'Content-Type': 'text/html;charset=utf-8' });
+        res.end(`
+          <html>
+
+

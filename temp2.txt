@@ -1,0 +1,107 @@
+﻿
+>   if (pn === '/api/playlist/add-song') {
+      try {
+        const info = await requireLogin(res);
+        if (!info) return;
+        const body = req.method === 'POST' ? await readRequestBody(req) : {};
+        const pid = body.pid || url.searchParams.get('pid');
+        const id = body.id || body.ids || url.searchParams.get('id') || url.searchParams.get('ids');
+        if (!pid || !id) { sendJSON(res, { error: 'Missing playlist id or song id' }, 400); return; }
+        const attempts = [];
+        let finalBody = null;
+        let finalCode = 0;
+        let finalMessage = '';
+        let success = false;
+  
+        const primary = await playlist_tracks({ op: 'add', pid, tracks: String(id), cookie: userCookie, timestamp: 
+Date.now() });
+        finalBody = primary.body || primary;
+        finalCode = normalizeApiCode(primary);
+        finalMessage = normalizeApiMessage(primary);
+        success = finalCode === 200 && !(finalBody && finalBody.error);
+        attempts.push({ api: 'playlist_tracks', code: finalCode, message: finalMessage, body: finalBody });
+  
+        if (!success && typeof playlist_track_add === 'function') {
+          try {
+            const fallback = await playlist_track_add({ pid, ids: String(id), cookie: userCookie, timestamp: 
+Date.now() });
+            finalBody = fallback.body || fallback;
+            finalCode = normalizeApiCode(fallback);
+            finalMessage = normalizeApiMessage(fallback);
+            success = finalCode === 200 && !(finalBody && finalBody.error);
+            attempts.push({ api: 'playlist_track_add', code: finalCode, message: finalMessage, body: finalBody });
+          } catch (fallbackErr) {
+            const errBody = fallbackErr.body || fallbackErr.response || {};
+            finalBody = errBody;
+            finalCode = normalizeApiCode(errBody);
+            finalMessage = normalizeApiMessage(errBody) || fallbackErr.message || '';
+            attempts.push({ api: 'playlist_track_add', code: finalCode, message: finalMessage, body: errBody });
+          }
+        }
+  
+        if (!success) {
+          sendJSON(res, { loggedIn: true, pid, id, success: false, code: finalCode, error: finalMessage || 
+'PLAYLIST_ADD_FAILED', attempts }, finalCode === 401 ? 401 : 409);
+          return;
+        }
+        sendJSON(res, { loggedIn: true, pid, id, success: true, code: finalCode, body: finalBody, attempts });
+      } catch (err) {
+        console.error('[PlaylistAddSong]', err);
+        sendJSON(res, { error: err.message }, 500);
+      }
+      return;
+    }
+  
+    // ---------- æ­Œè¯ ----------
+    if (pn === '/api/lyric') {
+      try {
+        const id = url.searchParams.get('id');
+        if (!id) { sendJSON(res, { error: 'Missing song id', lyric: '' }, 400); return; }
+        let body = {};
+        let source = 'lyric';
+        try {
+          if (typeof lyric_new === 'function') {
+            const nr = await lyric_new({ id, cookie: userCookie, timestamp: Date.now() });
+            body = nr.body || {};
+            source = 'lyric_new';
+          }
+        } catch (errNew) {
+          console.warn('[LyricNew]', errNew.message);
+        }
+        if (!((body.lrc && body.lrc.lyric) || (body.yrc && body.yrc.lyric))) {
+          const r = await lyric({ id, cookie: userCookie, timestamp: Date.now() });
+          body = r.body || body || {};
+          source = 'lyric';
+        }
+        sendJSON(res, {
+          lyric: (body.lrc && body.lrc.lyric) || '',
+          tlyric: (body.tlyric && body.tlyric.lyric) || '',
+          yrc: (body.yrc && body.yrc.lyric) || '',
+          source,
+        });
+      } catch (err) {
+        console.error('[Lyric]', err);
+        sendJSON(res, { error: err.message, lyric: '' }, 500);
+      }
+      return;
+    }
+  
+    // ---------- æ­Œæ›²è¯„è®º ----------
+    if (pn === '/api/song/comments') {
+      try {
+        const id = url.searchParams.get('id');
+        const limit = Math.max(6, Math.min(50, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
+        const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+        if (!id) { sendJSON(res, { error: 'Missing song id', comments: [] }, 400); return; }
+        const r = await comment_music({ id, limit, offset, cookie: userCookie, timestamp: Date.now() });
+        const body = r.body || r || {};
+        const raw = body.hotComments && offset === 0 ? body.hotComments : (body.comments || []);
+        const comments = (raw || []).map(c => ({
+          id: c.commentId,
+          content: c.content || '',
+          likedCount: c.likedCount || 0,
+          time: c.time || 0,
+          user: c.user ? { id: c.user.userId, nickname: c.user.nickname || '', avatar: c.user.avatarUrl || '' } : null,
+        })).filter(c => c.content);
+
+

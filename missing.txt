@@ -1,0 +1,188 @@
+  // ---------- Spotify App Credentials ----------
+  if (pn === '/api/spotify/credentials') {
+    if (req.method === 'POST') {
+      try {
+        const body = await readRequestBody(req);
+        saveSpotifyCredentials(body.clientId || '', body.clientSecret || '');
+        sendJSON(res, { ok: true, credentials: { clientId: spotifyCredentials.clientId, hasSecret: !!spotifyCredentials.clientSecret } });
+      } catch (err) {
+        sendJSON(res, { error: err.message }, 500);
+      }
+    } else {
+      sendJSON(res, {
+        credentials: {
+          clientId: spotifyCredentials.clientId,
+          hasSecret: !!spotifyCredentials.clientSecret
+        },
+        redirectUri: `http://127.0.0.1:${PORT}/api/spotify/login/callback`
+      });
+    }
+    return;
+  }
+  
+  // ---------- Spotify Auth Callback ----------
+  if (pn === '/api/spotify/login/callback') {
+    try {
+      const code = url.searchParams.get('code') || '';
+      if (!code) throw new Error('Authorization code missing');
+      const port = PORT || 3000;
+      const redirectUri = `http://127.0.0.1:${port}/api/spotify/login/callback`;
+      const authStr = Buffer.from(`${spotifyCredentials.clientId}:${spotifyCredentials.clientSecret}`).toString('base64');
+      const tokenRes = await safeFetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${authStr}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      });
+      if (!tokenRes.ok) {
+        const text = await tokenRes.text();
+        throw new Error(`Token exchange failed: ${text}`);
+      }
+      const data = await tokenRes.json();
+      saveSpotifyToken({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: Date.now() + (data.expires_in * 1000) - 60000,
+        scope: data.scope
+      });
+      res.writeHead(200, { 'Content-Type': 'text/html;charset=utf-8' });
+      res.end(`
+        <html>
+          <body>
+            <h2>Spotify 登录成功！</h2>
+            <p>可以关闭此页面返回播放器了。</p>
+            <script>setTimeout(() => { window.close(); }, 2000);</script>
+          </body>
+        </html>
+      `);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain;charset=utf-8' });
+      res.end(`Spotify Auth Error: ${err.message}`);
+    }
+    return;
+  }
+
+  // ---------- Spotify Login Status ----------
+  if (pn === '/api/spotify/login/status') {
+    try {
+      if (!spotifyTokenData || !spotifyTokenData.refresh_token) {
+        sendJSON(res, { provider: 'spotify', loggedIn: false });
+        return;
+      }
+      const token = await getSpotifyUserToken();
+      const meRes = await safeFetch('https://api.spotify.com/v1/me', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!meRes.ok) {
+        throw new Error(`Get profile status failed: ${meRes.status}`);
+      }
+      const me = await meRes.json();
+      sendJSON(res, {
+        provider: 'spotify',
+        loggedIn: true,
+        userId: me.id,
+        nickname: me.display_name || me.id,
+        avatar: me.images && me.images[0] ? me.images[0].url : '',
+        product: me.product,
+        token: token
+      });
+    } catch (err) {
+      console.error('[SpotifyLoginStatus]', err);
+      sendJSON(res, { provider: 'spotify', loggedIn: false, error: err.message });
+    }
+    return;
+  }
+  
+  // ---------- Spotify Logout ----------
+  if (pn === '/api/spotify/logout') {
+    saveSpotifyToken(null);
+    sendJSON(res, { provider: 'spotify', ok: true, loggedIn: false });
+    return;
+  }
+  
+  // ---------- Spotify Search ----------
+  if (pn === '/api/spotify/search') {
+    try {
+      const kw = url.searchParams.get('keywords') || '';
+      let limitVal = parseInt(url.searchParams.get('limit'), 10);
+      if (isNaN(limitVal)) limitVal = 8;
+      const limit = Math.max(1, Math.min(50, limitVal));
+      console.log('[SpotifySearch] Request received for keywords:', kw, 'parsedLimit:', limit);
+      if (!kw) {
+        sendJSON(res, { provider: 'spotify', songs: [] });
+        return;
+      }
+      let token;
+      try {
+        token = await getSpotifyUserToken();
+      } catch (e) {
+        token = await getSpotifyClientToken();
+      }
+      console.log('[SpotifySearch] Token obtained:', token ? token.substring(0, 10) + '...' : 'none');
+      
+      // Removed &limit=${limit} because Spotify recently started rejecting it with 400 Invalid limit for some tokens
+      const searchRes = await safeFetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(kw)}&type=track`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      console.log('[SpotifySearch] API search response status:', searchRes.status);
+      let data;
+      if (!searchRes.ok) {
+        console.warn('[SpotifySearch] Search with limit failed. Retrying without limit...');
+        const retryRes = await safeFetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(kw)}&type=track`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!retryRes.ok) {
+          const errText = await retryRes.text();
+          console.error('[SpotifySearch] Search without limit failed too:', errText);
+          throw new Error(`Spotify Search HTTP ${retryRes.status}: ${errText}`);
+        }
+        data = await retryRes.json();
+      } else {
+        data = await searchRes.json();
+      }
+      const songs = (data.tracks && data.tracks.items ? data.tracks.items : []).map(track => ({
+        id: track.id,
+        mid: track.id,
+        mediaMid: track.uri,
+        provider: 'spotify',
+        name: track.name,
+        artist: track.artists.map(a => a.name).join(' / '),
+        album: track.album.name,
+        picUrl: track.album.images && track.album.images[0] ? track.album.images[0].url : '',
+        duration: track.duration_ms / 1000,
+        playable: true,
+        previewUrl: track.preview_url || '',
+        artists: track.artists.map(a => ({ id: a.id, name: a.name })),
+        spotifyUri: track.uri
+      }));
+      sendJSON(res, { provider: 'spotify', songs });
+    } catch (err) {
+      console.error('[SpotifySearch]', err);
+      sendJSON(res, { provider: 'spotify', error: err.message, songs: [] }, 500);
+    }
+    return;
+  }
+  
+  // ---------- Phantom Audio Engine (Spotify Premium Standalone) ----------
+  if (pn === '/api/phantom/play') {
+    const phantom = require('./desktop/phantom-engine.js');
+    const uri = url.searchParams.get('uri');
+    phantom.playTrack(uri);
+    sendJSON(res, { ok: true });
+    return;
+  }
+  if (pn === '/api/phantom/pause') {
+    const phantom = require('./desktop/phantom-engine.js');
+    phantom.pauseTrack();
+    sendJSON(res, { ok: true });
+    return;
+  }
+  if (pn === '/api/phantom/resume') {
+    const phantom = require('./desktop/phantom-engine.js');
+    phantom.resumeTrack();
+    sendJSON(res, { ok: true });
+    return;
+  }

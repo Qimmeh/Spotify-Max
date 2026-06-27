@@ -1,0 +1,3 @@
+    var data = isQQPlayback
+      ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
+      : await apiJson('/api/song/url?id=' + song.id + qualityParam);

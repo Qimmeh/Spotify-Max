@@ -1,0 +1,23 @@
+async function playHomeDaily() {
+  homeForcedOpen = false;
+  homeSuppressed = false;
+  setHomeControlsLocked(false);
+  if (!hasAnyPlatformLogin() && !homeDiscoverState.loggedIn) {
+    showLoginModal({ source: 'home-daily' });
+    return;
+  }
+  await waitForHomeDiscoverIdle();
+  if (!homeDiscoverState.loaded || (!homeDiscoverState.songs.length && !homeDiscoverState.loading)) {
+    await loadHomeDiscover(true);
+  }
+  if (!homeDiscoverState.songs.length) {
+    runHomeSearch('每日推荐');
+    return;
+  }
+  playQueue = homeDiscoverState.songs.map(cloneSong);
+  currentIdx = 0;
+  safeRenderQueuePanel('home-daily');
+  safeShelfRebuild('home-daily', true);
+  forcePlaybackControlsInteractive();
+  playQueueAt(0).catch(function(e){ console.warn('[HomeDailyPlay]', e); });
+}

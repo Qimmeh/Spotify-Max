@@ -1,0 +1,18 @@
+async function fetchMusicSearchResults(q, mode) {
+  if (mode === 'qq') {
+    var qqOnly = await apiJson('/api/qq/search?keywords=' + encodeURIComponent(q) + '&limit=12');
+    return mergeSongSearchResults([], qqOnly.songs || [], 18, q);
+  }
+  if (mode === 'netease') {
+    var neOnly = await apiJson('/api/search?keywords=' + encodeURIComponent(q) + '&limit=18');
+    return mergeSongSearchResults(neOnly.songs || [], [], 18, q);
+  }
+  var result = await Promise.allSettled([
+    apiJson('/api/search?keywords=' + encodeURIComponent(q) + '&limit=14'),
+    apiJson('/api/qq/search?keywords=' + encodeURIComponent(q) + '&limit=12')
+  ]);
+  var neteaseSongs = result[0].status === 'fulfilled' ? ((result[0].value && result[0].value.songs) || []) : [];
+  var qqSongs = result[1].status === 'fulfilled' ? ((result[1].value && result[1].value.songs) || []) : [];
+  if (result[1].status === 'rejected') console.warn('QQ search failed:', result[1].reason);
+  return mergeSongSearchResults(neteaseSongs, qqSongs, 18, q);
+}

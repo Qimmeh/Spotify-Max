@@ -57,7 +57,7 @@ for (const [name, value] of CHROMIUM_PERFORMANCE_SWITCHES) {
   else app.commandLine.appendSwitch(name, value);
 }
 
-// 清�?��?�能残留的 Chromium �?�例�?（强制�?�进程�?��?�能�?�留）
+// 清�?��?�能残留的 Chromium �?�例�?（强制�?�进程�?��?�能�?�留）
 try {
   const userDataPath = app.getPath('userData');
   for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
@@ -179,7 +179,7 @@ function configureMineradioGlobalHotkeys(bindings = []) {
         conflict: {
           sourceName: '系统 / 其他软件',
           sourceIcon: 'warning',
-          reason: '该组�?�键已被�?�用或被系统�?留',
+          reason: '该组�?�键已被�?�用或被系统�?留',
         },
       });
     }
@@ -428,7 +428,7 @@ async function openNeteaseMusicLoginWindow(owner) {
       modal: false,
       show: false,
       autoHideMenuBar: true,
-      title: '网易云音�?登录',
+      title: '网易云音�?登录',
       backgroundColor: '#111111',
       icon: APP_ICON_ICO,
       webPreferences: {
@@ -481,7 +481,7 @@ async function openNeteaseMusicLoginWindow(owner) {
             const nodes = Array.from(doc.querySelectorAll('a, button, span, div'));
             const loginNode = nodes.find((node) => {
               const text = (node.textContent || '').trim();
-              if (!/登录|立�?�登录/.test(text)) return false;
+              if (!/登录|立�?�登录/.test(text)) return false;
               const rect = node.getBoundingClientRect();
               return rect.width > 0 && rect.height > 0;
             });
@@ -500,9 +500,9 @@ async function openNeteaseMusicLoginWindow(owner) {
         const cookie = await readNeteaseLoginCookieHeader(cookieSession);
         resolve(neteaseCookieHasLogin(cookie)
           ? { ok: true, cookie, partial: !qqCookieHasPlaybackLogin(cookie) }
-          : { ok: false, cancelled: true, message: '网易云登录窗�?�已关闭' });
+          : { ok: false, cancelled: true, message: '网易云登录窗�?�已关闭' });
       } catch (e) {
-        resolve({ ok: false, error: e.message || '网易云登录窗�?�已关闭' });
+        resolve({ ok: false, error: e.message || '网易云登录窗�?�已关闭' });
       }
     });
 
@@ -530,7 +530,7 @@ async function openQQMusicLoginWindow(owner) {
       modal: false,
       show: false,
       autoHideMenuBar: true,
-      title: 'QQ 音�?登录',
+      title: 'QQ 音�?登录',
       backgroundColor: '#111111',
       icon: APP_ICON_ICO,
       webPreferences: {
@@ -602,9 +602,9 @@ async function openQQMusicLoginWindow(owner) {
         const cookie = await readQQLoginCookieHeader(cookieSession);
         resolve(qqCookieHasLogin(cookie)
           ? { ok: true, cookie }
-          : { ok: false, cancelled: true, message: 'QQ 登录窗�?�已关闭' });
+          : { ok: false, cancelled: true, message: 'QQ 登录窗�?�已关闭' });
       } catch (e) {
-        resolve({ ok: false, error: e.message || 'QQ 登录窗�?�已关闭' });
+        resolve({ ok: false, error: e.message || 'QQ 登录窗�?�已关闭' });
       }
     });
 
@@ -668,7 +668,7 @@ function openSpotifyLoginWindow(owner, clientId) {
       if (urlStr.includes('/api/spotify/login/callback')) {
         if (!resolved) {
           resolved = true;
-          // 直接在主进程中触�?�回调请求，确�?�?功�?��?关闭窗�?�
+          // 直接在主进程中触�?�回调请求，确�?�?功�?��?关闭窗�?�
           const { net } = require('electron');
           net.fetch(urlStr)
             .then(() => {
@@ -1483,11 +1483,12 @@ async function refreshPhantomSpotifyToken() {
   const win = createPhantomPlayer();
   if (!win || win.isDestroyed()) return null;
   try {
-    if (win.webContents.isLoading()) {
+    const url = win.webContents.getURL();
+    if (win.webContents.isLoading() || !url.includes('spotify.com')) {
       await new Promise(resolve => {
         const done = () => resolve();
         win.webContents.once('did-finish-load', done);
-        setTimeout(done, 3500);
+        setTimeout(done, 5000);
       });
     }
     const token = await win.webContents.executeJavaScript(`
@@ -1528,7 +1529,11 @@ function openSpotifyLoginWindow(owner) {
         setTimeout(() => {
           if (!loginWindow.isDestroyed()) {
             loginWindow.close();
-            createPhantomPlayer();
+            const pw = createPhantomPlayer();
+            if (pw && !pw.isDestroyed()) {
+              pw.reload();
+              phantomToken = null;
+            }
             resolve({ ok: true });
           }
         }, 3000);
@@ -1591,8 +1596,8 @@ async function createWindow() {
       nodeIntegration: false,
       sandbox: false,
       backgroundThrottling: false,
-      plugins: true,                    // Widevine CDM 需�?
-      allowRunningInsecureContent: true, // �?许 http 页�?�加载 Spotify SDK (https)
+      plugins: true,                    // Widevine CDM 需�?
+      allowRunningInsecureContent: true, // �?许 http 页�?�加载 Spotify SDK (https)
     },
   });
 

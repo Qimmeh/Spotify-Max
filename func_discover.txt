@@ -1,0 +1,27 @@
+async function loadHomeDiscover(force) {
+  if (homeDiscoverState.loading) return;
+  if (homeDiscoverState.loaded && !force) return;
+  var token = ++homeDiscoverToken;
+  homeDiscoverState.loading = true;
+  homeDiscoverState.error = '';
+  renderHomeDiscover();
+  try {
+    var data = await apiJson('/api/discover/home?t=' + Date.now());
+    if (token !== homeDiscoverToken) return;
+    homeDiscoverState.loggedIn = !!(data && data.loggedIn);
+    homeDiscoverState.mode = data && data.mode || (homeDiscoverState.loggedIn ? 'member' : 'starter');
+    homeDiscoverState.songs = homeDiscoverState.loggedIn ? (data && data.dailySongs || []).map(cloneSong) : [];
+    homeDiscoverState.playlists = homeDiscoverState.loggedIn ? (data && data.playlists || []) : [];
+    homeDiscoverState.podcasts = homeDiscoverState.loggedIn ? (data && data.podcasts || []) : [];
+    homeDiscoverState.updatedAt = Number(data && data.updatedAt) || Date.now();
+    homeDiscoverState.loaded = true;
+  } catch (e) {
+    console.warn('home discover failed:', e);
+    if (token === homeDiscoverToken) homeDiscoverState.error = 'DISCOVER_FAILED';
+  } finally {
+    if (token === homeDiscoverToken) {
+      homeDiscoverState.loading = false;
+      renderHomeDiscover();
+    }
+  }
+}

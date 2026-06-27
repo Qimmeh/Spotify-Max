@@ -1,0 +1,20 @@
+playTrack(uri) {
+  ensureWindow();
+  console.log('[PhantomEngine] Playing URI:', uri);
+  const trackId = uri.split(':').pop();
+
+  // Navigate to the Spotify track page
+  try {
+    await playbackWindow.loadURL(SPOTIFY_BASE + '/track/' + trackId);
+  } catch (e) {
+    console.warn('[PhantomEngine] Track load error:', e.message);
+  }
+
+  // Wait for React UI to mount, then click the play button
+  try {
+    // Give the SPA time to render the track page
+    await new Promise(function(r) { setTimeout(r, 3000); });
+
+    await playbackWindow.webContents.executeJavaScript([
+      '(function() {',
+      '

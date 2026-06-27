@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+// Spotify Web Playback SDK host page for Mineradio
+// Token is passed via URL query parameter
+var _player = null;
+var _deviceId = null;
+var _token = '';
+
+function initSpotifyPlayer(token) {
+  _token = token;
+  window.onSpotifyWebPlaybackSDKReady = function() {
+    _player = new Spotify.Player({
+      name: 'Mineradio',
+      getOAuthToken: function(cb) { cb(token); },
+      volume: 0.5
+    });
+
+    _player.addListener('ready', function(data) {
+      _deviceId = data.device_id;
+      console.log('[SpotifyPlayer] Ready, device_id:', _deviceId);
+      // Signal device_id back to main process via global promise resolver
+      if (window.__onReady) {
+        window.__onReady(_deviceId);
+      }
+    });
+
+    _player.addListener('not_ready', function(data) {
+      console.warn('[SpotifyPlayer] Not ready:', data.message);
+      _deviceId = null;
+    });
+
+    _player.addListener('player_state_changed', function(state) {
+      if (window.__onStateChange) {
+        window.__onStateChange(state);
+      }
+    });
+
+    _player.connect().then(function(success) {
+      if (!success) {
+        console.error('[SpotifyPlayer] Connection failed');
+      }
+    });
+  };
+
+  // Load the Web Playback SDK
+  var s = document.createElement('script');
+  s.src = 'https://sdk.scdn.co/spotify-player.js';
+  s.async = true;
+  document.head.appendChild(s);
+}
+
+// Read token from URL and initialize
+(function() {
+  var params = new URLSearchParams(location.search);
+  var token = params.get('token');
+  if (token) {
+    initSpotifyPlayer(token);
+  }
+})();
+</script>
+</body>
+</html>

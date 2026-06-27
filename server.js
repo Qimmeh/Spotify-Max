@@ -87,6 +87,74 @@ const WEATHER_DEFAULT_LOCATION = {
 
 const updateDownloadJobs = new Map();
 
+// ---------- Spotify OAuth ----------
+const SPOTIFY_CREDENTIALS_PATH = path.join(__dirname, '.spotify-credentials');
+const SPOTIFY_TOKEN_PATH = path.join(__dirname, '.spotify-token');
+let spotifyCredentials = null;
+let spotifyServerToken = null;
+let spotifyServerTokenExpiresAt = 0;
+let spotifyUserToken = null;
+try {
+  if (fs.existsSync(SPOTIFY_CREDENTIALS_PATH)) {
+    spotifyCredentials = JSON.parse(fs.readFileSync(SPOTIFY_CREDENTIALS_PATH, 'utf8'));
+  }
+} catch (e) { console.warn('[Spotify] Credentials load failed:', e.message); }
+try {
+  if (fs.existsSync(SPOTIFY_TOKEN_PATH)) {
+    spotifyUserToken = JSON.parse(fs.readFileSync(SPOTIFY_TOKEN_PATH, 'utf8'));
+  }
+} catch (e) { console.warn('[Spotify] Token load failed:', e.message); }
+async function getSpotifyClientToken() {
+  if (!spotifyCredentials || !spotifyCredentials.clientId || !spotifyCredentials.clientSecret) return null;
+  if (spotifyServerToken && spotifyServerTokenExpiresAt > Date.now()) return spotifyServerToken;
+  try {
+    const basic = Buffer.from(spotifyCredentials.clientId + ':' + spotifyCredentials.clientSecret).toString('base64');
+    const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { 'Authorization': 'Basic ' + basic, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=client_credentials' });
+    if (!r.ok) return null;
+    const d = await r.json();
+    spotifyServerToken = d.access_token;
+    spotifyServerTokenExpiresAt = Date.now() + (d.expires_in - 60) * 1000;
+    return spotifyServerToken;
+  } catch (e) { console.warn('[Spotify] Client token failed:', e.message); return null; }
+}
+async function refreshSpotifyUserToken() {
+  if (!spotifyUserToken || !spotifyUserToken.refresh_token || !spotifyCredentials) return null;
+  try {
+    const basic = Buffer.from(spotifyCredentials.clientId + ':' + spotifyCredentials.clientSecret).toString('base64');
+    const r = await fetch('https://accounts.spotify.com/api/token', { method: 'POST', headers: { 'Authorization': 'Basic ' + basic, 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + spotifyUserToken.refresh_token });
+    if (!r.ok) return null;
+    const d = await r.json();
+    spotifyUserToken.access_token = d.access_token;
+    if (d.refresh_token) spotifyUserToken.refresh_token = d.refresh_token;
+    spotifyUserToken.expires_at = Date.now() + (d.expires_in || 3600) * 1000;
+    try { fs.writeFileSync(SPOTIFY_TOKEN_PATH, JSON.stringify(spotifyUserToken, null, 2), 'utf8'); } catch (e) {}
+    return spotifyUserToken.access_token;
+  } catch (e) { console.warn('[Spotify] User token refresh failed:', e.message); return null; }
+}
+async function getSpotifyApiToken(requireUser) {
+  if (spotifyUserToken && spotifyUserToken.access_token) {
+    if (spotifyUserToken.expires_at <= Date.now()) {
+      if (spotifyUserToken.refresh_token) { var r = await refreshSpotifyUserToken(); if (r) return r; }
+      if (requireUser) return null;
+    } else { return spotifyUserToken.access_token; }
+  }
+  if (requireUser) return null;
+  return await getSpotifyClientToken();
+}
+function spotifyHttpsRequest(method, host, path, headers) {
+  return new Promise(function(resolve, reject) {
+    var opts = { hostname: host, port: 443, path: path, method: method, headers: headers || {} };
+    if (!opts.headers["User-Agent"]) opts.headers["User-Agent"] = "Mineradio/1.0";
+    var r = require("https").request(opts, function(res) {
+      var body = "";
+      res.on("data", function(c) { body += c; });
+      res.on("end", function() { resolve({ status: res.statusCode, body: body }); });
+    });
+    r.on("error", function(e) { reject(e); });
+    r.end();
+  });
+}
+
 function applySystemCertificateAuthorities() {
   try {
     if (typeof tls.getCACertificates !== 'function' || typeof tls.setDefaultCACertificates !== 'function') return;
@@ -3412,6 +3480,60 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+
+  // ---------- Spotify API ----------
+  if (pn === '/api/spotify/token') {
+    try {
+      var t = await getSpotifyApiToken(false);
+      sendJSON(res, { ok: !!t, token: t, loggedIn: !!(spotifyUserToken && spotifyUserToken.access_token) });
+    } catch (err) { sendJSON(res, { ok: false, error: err.message }, 500); }
+    return;
+  }
+  if (pn === '/api/spotify/search') {
+    try {
+      var q = url.searchParams.get("q") || "";
+      if (!q) { sendJSON(res, { ok: false, error: "Missing query" }, 400); return; }
+      var t = await getSpotifyApiToken(false);
+      if (!t) { sendJSON(res, { ok: false, error: "No Spotify token" }, 503); return; }
+      var sr = await spotifyHttpsRequest("GET", "api.spotify.com", "/v1/search?q=" + encodeURIComponent(q) + "&type=track&limit=10", { "Authorization": "Bearer " + t });
+      if (sr.status !== 200) { sendJSON(res, { ok: false, error: "Spotify API " + sr.status, detail: String(sr.body).substring(0,200) }, sr.status); return; }
+      sendJSON(res, JSON.parse(sr.body));
+    } catch (err) { sendJSON(res, { ok: false, error: err.message }, 500); }
+    return;
+  }
+  if (pn === '/api/spotify/me') {
+    try {
+      var t = await getSpotifyApiToken(true);
+      if (!t) { sendJSON(res, { ok: false, loggedIn: false, error: "Not logged in" }, 401); return; }
+      var sr = await spotifyHttpsRequest("GET", "api.spotify.com", "/v1/me", { "Authorization": "Bearer " + t });
+      if (sr.status !== 200) { sendJSON(res, { ok: false, loggedIn: false, error: "Spotify API " + sr.status }, sr.status); return; }
+      sendJSON(res, { ok: true, loggedIn: true, data: JSON.parse(sr.body) });
+    } catch (err) { sendJSON(res, { ok: false, error: err.message }, 500); }
+    return;
+  }
+  if (pn === '/api/spotify/me/tracks') {
+    try {
+      var t = await getSpotifyApiToken(true);
+      if (!t) { sendJSON(res, { ok: false, items: [], error: "Not logged in" }, 401); return; }
+      var sr = await spotifyHttpsRequest("GET", "api.spotify.com", "/v1/me/tracks?limit=20", { "Authorization": "Bearer " + t });
+      if (sr.status !== 200) { sendJSON(res, { ok: false, items: [], error: "Spotify API " + sr.status }, sr.status); return; }
+      var td = JSON.parse(sr.body);
+      sendJSON(res, { ok: true, items: td.items || [] });
+    } catch (err) { sendJSON(res, { ok: false, items: [], error: err.message }, 500); }
+    return;
+  }
+  if (pn === '/api/spotify/save-token' && req.method === 'POST') {
+    try {
+      var b = JSON.parse(await readRequestBody(req));
+      if (b && b.access_token) {
+        if (!spotifyUserToken) spotifyUserToken = {};
+        Object.keys(b).forEach(function(k) { if (b[k] !== null && b[k] !== undefined && String(b[k]).trim() !== "") { spotifyUserToken[k] = b[k]; } });
+        fs.writeFileSync(SPOTIFY_TOKEN_PATH, JSON.stringify(spotifyUserToken, null, 2), "utf8");
+      }
+      sendJSON(res, { ok: true });
+    } catch (err) { sendJSON(res, { ok: false, error: err.message }, 500); }
+    return;
+  }
   // ---------- 搜索 ----------
   if (pn === '/api/search') {
     try {

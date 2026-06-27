@@ -1,0 +1,8 @@
+og('[PhantomEngine] Play button result:', result);
+    // Check if audio is actually playing
+    var playingState = await playbackWindow.webContents.executeJavaScript([
+      '(function() {',
+      '  var playing = !!document.querySelector('[data-testid="control-button-pause"]');',
+      '  var loggedIn = !!document.querySelector('[data-testid="user-widget-link"]');',
+      '  var nowPlaying = document.querySelector('[data-testid="now-playing-widget"]') ? true : false;',
+      '  var playBtn = document.querySelecto

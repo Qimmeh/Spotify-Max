@@ -1,139 +1,178 @@
-const puppeteer = require('puppeteer-core');
-const fs = require('fs');
-const path = require('path');
-const { app } = require('electron');
+﻿const { BrowserWindow } = require("electron");
+const path = require("path");
+const https = require("https");
 
-let browser = null;
-let page = null;
+var PLAYER_HTML = path.join(__dirname, "spotify-player.html");
 
-function findChromePath() {
-    const paths = [
-        process.env.ProgramFiles + '\\Google\\Chrome\\Application\\chrome.exe',
-        process.env['ProgramFiles(x86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
-        process.env.LocalAppData + '\\Google\\Chrome\\Application\\chrome.exe',
-        process.env.ProgramFiles + '\\Microsoft\\Edge\\Application\\msedge.exe',
-        process.env['ProgramFiles(x86)'] + '\\Microsoft\\Edge\\Application\\msedge.exe'
-    ];
-    for (const p of paths) {
-        if (fs.existsSync(p)) return p;
+var playerWindow = null;
+var deviceId = null;
+var currentToken = null;
+
+function setToken(token) {
+  currentToken = token;
+}
+
+function ensureWindow() {
+  if (playerWindow && !playerWindow.isDestroyed()) {
+    return playerWindow;
+  }
+
+  playerWindow = new BrowserWindow({
+    width: 1,
+    height: 1,
+    x: 0,
+    y: 0,
+    show: true,
+    skipTaskbar: true,
+    frame: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: false
     }
-    return null;
+  });
+
+  playerWindow.on("closed", function() {
+    playerWindow = null;
+    deviceId = null;
+  });
+
+  return playerWindow;
 }
 
 async function initPhantomEngine() {
-    if (browser) return;
-    
-    const chromePath = findChromePath();
-    if (!chromePath) {
-        console.error('[PhantomEngine] Chrome or Edge not found.');
-        return;
-    }
+  if (!currentToken) {
+    console.warn("[PhantomEngine] No token set");
+    return;
+  }
 
-    const userDataDir = path.join(app.getPath('userData'), 'phantom-profile');
+  var win = ensureWindow();
+  var url = "file://" + PLAYER_HTML.replace(/\\/g, "/") + "?token=" + encodeURIComponent(currentToken);
+  win.loadURL(url).catch(function(e) {
+    console.warn("[PhantomEngine] Load error:", e.message);
+  });
 
-    console.log('[PhantomEngine] Launching browser visibly...');
-    browser = await puppeteer.launch({
-        executablePath: chromePath,
-        headless: false,
-        defaultViewport: null,
-        userDataDir: userDataDir,
-        ignoreDefaultArgs: ['--enable-automation'],
-        args: [
-            '--window-size=1000,800',
-            '--disable-gpu',
-            '--disable-notifications'
-        ]
-    });
-
-    page = await browser.newPage();
-    try {
-      await page.goto('https://open.spotify.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch (e) {
-      console.warn('[PhantomEngine] Initial page goto timeout/error:', e.message);
-    }
-
-    // Try to bring the page to front explicitly
-    await page.bringToFront();
-
-    const isLoggedIn = await page.evaluate(() => {
-        return !!document.querySelector('[data-testid="user-widget-link"]');
-    });
-
-    if (isLoggedIn) {
-        console.log('[PhantomEngine] Already logged in. Minimizing window.');
-        const session = await page.target().createCDPSession();
-        const { windowId } = await session.send('Browser.getWindowForTarget');
-        await session.send('Browser.setWindowBounds', {
-            windowId,
-            bounds: { windowState: 'minimized' }
-        });
-    } else {
-        console.log('[PhantomEngine] Not logged in. Waiting for user login...');
-        while (true) {
-            try {
-                const loggedInNow = await page.evaluate(() => {
-                    return !!document.querySelector('[data-testid="user-widget-link"]');
-                });
-                if (loggedInNow) break;
-            } catch (e) {}
-            await new Promise(r => setTimeout(r, 2000));
+  // Wait for device_id from the Web Playback SDK
+  try {
+    deviceId = await new Promise(function(resolve) {
+      var resolved = false;
+      var timeout = setTimeout(function() {
+        if (!resolved) {
+          resolved = true;
+          console.warn("[PhantomEngine] SDK init timeout");
+          resolve(null);
         }
-        console.log('[PhantomEngine] Login successful. Minimizing window.');
-        const session = await page.target().createCDPSession();
-        const { windowId } = await session.send('Browser.getWindowForTarget');
-        await session.send('Browser.setWindowBounds', {
-            windowId,
-            bounds: { windowState: 'minimized' }
+      }, 20000);
+
+      // Poll for __onReady to be set by the page
+      function poll() {
+        win.webContents.executeJavaScript([
+          "(function() {",
+          "  if (typeof window.__onReady === 'function') {",
+          "    return new Promise(function(res) {",
+          "      window.__onReady = res;",
+          "    });",
+          "  }",
+          "  return null;",
+          "})();"
+        ].join("\n")).then(function(result) {
+          if (resolved) return;
+          if (result !== null) {
+            resolved = true;
+            clearTimeout(timeout);
+            resolve(result);
+          } else {
+            setTimeout(poll, 500);
+          }
+        }).catch(function() {
+          if (!resolved) setTimeout(poll, 500);
         });
-    }
+      }
+      setTimeout(poll, 1000);
+    });
+    console.log("[PhantomEngine] Device ID:", deviceId);
+  } catch (e) {
+    console.warn("[PhantomEngine] init error:", e.message);
+  }
+}
+
+function spotifyRequest(method, apiPath, body) {
+  return new Promise(function(resolve, reject) {
+    var opts = {
+      hostname: "api.spotify.com",
+      port: 443,
+      path: apiPath,
+      method: method,
+      headers: {
+        "Authorization": "Bearer " + (currentToken || ""),
+        "Content-Type": "application/json"
+      }
+    };
+    if (body) opts.headers["Content-Length"] = Buffer.byteLength(body);
+
+    var req = https.request(opts, function(res) {
+      var data = "";
+      res.on("data", function(chunk) { data += chunk; });
+      res.on("end", function() {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error("Spotify API " + res.statusCode + ": " + data.substring(0, 200)));
+        }
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
 async function playTrack(uri) {
-    if (!page) await initPhantomEngine();
-    console.log('[PhantomEngine] Playing URI:', uri);
-    const trackId = uri.split(':').pop();
-    try {
-        await page.goto('https://open.spotify.com/track/' + trackId, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      } catch (e) {
-        console.warn('[PhantomEngine] Track goto timeout/error:', e.message);
-      }
-    
-    try {
-        await page.waitForSelector('[data-testid="play-button"]', { timeout: 10000 });
-        await page.click('[data-testid="play-button"]');
-        console.log('[PhantomEngine] Clicked play on track.');
-    } catch (e) {
-        console.error('[PhantomEngine] Failed to click play:', e.message);
-    }
+  if (!deviceId || !currentToken) {
+    console.warn("[PhantomEngine] Missing device or token");
+    return;
+  }
+  try {
+    var body = JSON.stringify({ uris: [uri] });
+    await spotifyRequest("PUT", "/v1/me/player/play?device_id=" + encodeURIComponent(deviceId), body);
+    console.log("[PhantomEngine] Played:", uri);
+  } catch (e) {
+    console.error("[PhantomEngine] Play failed:", e.message);
+  }
 }
 
 async function pauseTrack() {
-    if (!page) return;
-    try {
-        await page.evaluate(() => {
-            const btn = document.querySelector('[data-testid="control-button-pause"]');
-            if (btn) btn.click();
-        });
-    } catch (e) {
-        console.error('[PhantomEngine] Failed to pause:', e.message);
-    }
+  if (!deviceId || !currentToken) return;
+  try {
+    await spotifyRequest("PUT", "/v1/me/player/pause?device_id=" + encodeURIComponent(deviceId));
+  } catch (e) {
+    console.error("[PhantomEngine] Pause failed:", e.message);
+  }
 }
 
 async function resumeTrack() {
-    if (!page) return;
-    try {
-        await page.evaluate(() => {
-            const btn = document.querySelector('[data-testid="control-button-play"]');
-            if (btn) btn.click();
-        });
-    } catch (e) {
-        console.error('[PhantomEngine] Failed to resume:', e.message);
-    }
+  if (!deviceId || !currentToken) return;
+  try {
+    await spotifyRequest("PUT", "/v1/me/player/play?device_id=" + encodeURIComponent(deviceId));
+  } catch (e) {
+    console.error("[PhantomEngine] Resume failed:", e.message);
+  }
+}
+
+function cleanup() {
+  if (playerWindow && !playerWindow.isDestroyed()) {
+    try { playerWindow.close(); } catch (e) {}
+  }
+  playerWindow = null;
+  deviceId = null;
 }
 
 module.exports = {
-    initPhantomEngine,
-    playTrack,
-    pauseTrack,
-    resumeTrack
+  setToken: setToken,
+  initPhantomEngine: initPhantomEngine,
+  playTrack: playTrack,
+  pauseTrack: pauseTrack,
+  resumeTrack: resumeTrack,
+  cleanup: cleanup
 };

@@ -1242,11 +1242,51 @@ ipcMain.handle('mineradio-import-json-file', async (event) => {
 });
 
 ipcMain.handle('phantom-spotify-open-login', async (event) => {
-  return openSpotifyLoginWindow(getSenderWindow(event));
+  var result = await openSpotifyLoginWindow(getSenderWindow(event));
+  // After login, wait for token and save it
+  try {
+    var savedToken = null;
+    for (var i = 0; i < 15; i++) {
+      savedToken = phantomToken || await refreshPhantomSpotifyToken();
+      if (savedToken) break;
+      await new Promise(function(r){ setTimeout(r, 1000); });
+    }
+    if (savedToken) {
+      // Save token to server
+      var tokenData = JSON.stringify({
+        access_token: savedToken
+      });
+      try {
+        var serverPort = mainServerPort || 3000;
+        var saveRes = await fetch('http://127.0.0.1:' + serverPort + '/api/spotify/save-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: tokenData,
+        });
+        if (saveRes.ok) console.log('[Spotify] Token saved after login');
+      } catch (e) {
+        console.warn('[Spotify] Failed to save token:', e.message);
+      }
+    }
+  } catch (e) {
+    console.warn('[Spotify] Post-login token extraction failed:', e.message);
+  }
+  // Initialize Phantom Engine with OAuth token for playback
+  try {
+    await refreshSpotifyEngineToken();
+  } catch (e) {
+    console.warn('[Spotify] Engine token refresh after login failed:', e.message);
+  }
+  return result;
 });
 
 ipcMain.handle('phantom-spotify-get-token', async () => {
-  return phantomToken || await refreshPhantomSpotifyToken();
+  try {
+    return phantomToken || await refreshPhantomSpotifyToken();
+  } catch (e) {
+    console.warn('[Phantom] get token failed:', e);
+    return null;
+  }
 });
 
 ipcMain.handle('phantom-spotify-execute', async (event, jsCode) => {
@@ -1265,6 +1305,8 @@ ipcMain.handle('phantom-spotify-play-uri', async (event, uri) => {
     if (!uri || !/^spotify:track:[A-Za-z0-9]+$/.test(String(uri))) {
       return { ok: false, error: 'INVALID_SPOTIFY_URI' };
     }
+    // Ensure engine has a valid OAuth token
+    await refreshSpotifyEngineToken();
     await phantomSpotifyEngine.playTrack(String(uri));
     return { ok: true };
   } catch (e) {
@@ -1296,6 +1338,14 @@ ipcMain.handle('phantom-spotify-logout', async () => {
     if (phantomWindow && !phantomWindow.isDestroyed()) {
       try { phantomWindow.close(); } catch (e) {}
     }
+    // Also destroy the hidden playback window from phantom-engine
+    try {
+      if (typeof phantomSpotifyEngine === 'object' && phantomSpotifyEngine.cleanup) {
+        phantomSpotifyEngine.cleanup();
+      }
+    } catch (e) {
+      console.warn('[Spotify] Playback window cleanup:', e.message);
+    }
     await clearSpotifyLoginSession();
     return { ok: true };
   } catch (e) {
@@ -1303,6 +1353,26 @@ ipcMain.handle('phantom-spotify-logout', async () => {
   }
 });
 
+
+
+
+// Helper: fetch OAuth token from local server and configure the SDK-based engine
+async function refreshSpotifyEngineToken() {
+  var serverPort = mainServerPort || 3000;
+  try {
+    var resp = await fetch("http://127.0.0.1:" + serverPort + "/api/spotify/token");
+    var data = await resp.json();
+    if (data && data.token) {
+      phantomSpotifyEngine.setToken(data.token);
+      // Initialize the Web Playback SDK engine (creates hidden player window)
+      phantomSpotifyEngine.initPhantomEngine().catch(function(e) {
+        console.warn("[PhantomEngine] init:", e.message);
+      });
+    }
+  } catch (e) {
+    console.warn("[Spotify] Token fetch failed:", e.message);
+  }
+}
 
 
 ipcMain.handle('mineradio-open-update-installer', async (_event, filePath) => {

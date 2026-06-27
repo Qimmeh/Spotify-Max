@@ -1906,11 +1906,7 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
       <svg id="search-icon" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input id="search-input" type="text" placeholder="搜索歌曲、歌手..." autocomplete="off" spellcheck="false">
     </div>
-    <div id="search-mode-tabs" class="search-mode-tabs" role="tablist" aria-label="Search mode">
-      <button id="search-mode-song" class="active" type="button" onclick="setSearchMode('song')" aria-selected="true">All</button>
-      <button id="search-mode-netease" type="button" onclick="setSearchMode('netease')" aria-selected="false">NE</button>
-      <button id="search-mode-qq" type="button" onclick="setSearchMode('qq')" aria-selected="false">QQ</button>
-      <button id="search-mode-podcast" type="button" onclick="setSearchMode('podcast')" aria-selected="false">Podcast</button>
+    <div id="search-mode-tabs" class="search-mode-tabs" role="tablist" aria-label="Search mode" style="display:none;">
     </div>
     <div id="search-results"></div>
   </div>
@@ -2487,23 +2483,13 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
 <div id="user-modal" class="modal-mask">
   <div class="modal dual-user-modal">
     <h2>账号信息</h2>
-    <div id="account-provider-chip" class="account-provider-chip netease"><span class="account-source-dot netease"></span><span>网易云音乐</span></div>
+    <div id="account-provider-chip" class="account-provider-chip spotify"><span class="account-source-dot spotify"></span><span>Spotify</span></div>
     <img id="user-modal-avatar" src="" style="width:72px;height:72px;border-radius:50%;margin:0 auto 12px;object-fit:cover;background:rgba(255,255,255,0.1);display:block">
     <div id="user-modal-name" style="font-size:15px;margin-bottom:4px"></div>
     <div id="user-modal-vip" style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:20px;letter-spacing:.5px"></div>
-    <div class="user-platform-tabs" id="user-platform-tabs">
-      <button id="user-provider-netease" class="netease active" type="button" onclick="setActiveAccountProvider('netease')">网易云</button>
-      <button id="user-provider-qq" class="qq" type="button" onclick="setActiveAccountProvider('qq')">QQ 音乐</button>
-      <button id="user-provider-both" class="both" type="button" onclick="enableDualAccountView()">我两个都要</button>
-    </div>
-    <div class="account-modal-actions">
-      <button id="account-add-netease" class="modal-btn" onclick="openProviderLogin('netease')">补登网易云</button>
-      <button id="account-add-qq" class="modal-btn" onclick="openProviderLogin('qq')">补登 QQ 音乐</button>
-    </div>
-    <div id="account-hint" class="account-hint">QQ 音乐真实登录暂未接入，当前先预览双平台账号交互。</div>
     <div class="btn-row">
       <button class="modal-btn" onclick="closeUserModal()">关闭</button>
-      <button id="account-logout-btn" class="modal-btn primary" onclick="logoutActiveAccount()">退出当前平台</button>
+      <button id="account-logout-btn" class="modal-btn primary" onclick="logoutActiveAccount()">退出登录</button>
     </div>
   </div>
 </div>
@@ -15632,39 +15618,27 @@ async function loadHomeDiscover(force) {
   try {
     let hasSpotify = false;
     let songs = [];
-    if (window.desktopWindow && typeof window.desktopWindow.getPhantomSpotifyToken === 'function') {
-      let spToken = await window.desktopWindow.getPhantomSpotifyToken();
-      let retries = 0;
-      while (!spToken && retries < 10) {
-         await new Promise(r => setTimeout(r, 1000));
-         spToken = await window.desktopWindow.getPhantomSpotifyToken();
-         retries++;
-      }
-      if (spToken) {
+    try {
+      var trackRes = await apiJson('/api/spotify/me/tracks');
+      if (trackRes && trackRes.ok && trackRes.items) {
         hasSpotify = true;
-        let res = await window.desktopWindow.executePhantomSpotify(`
-           fetch('https://api.spotify.com/v1/me/tracks?limit=20', {
-             headers: { 'Authorization': 'Bearer ${spToken}' }
-           }).then(r => r.json())
-        `);
-        if (res && res.ok && res.result && res.result.items) { res = res.result; }
-        if (res && res.items) {
-          songs = res.items.map(item => {
-             const t = item.track || item;
-             return {
-               id: t.id,
-               name: t.name,
-               artist: (t.artists || []).map(a => a.name).join(', '),
-               album: t.album && t.album.name ? t.album.name : '',
-               cover: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : '',
-               duration: t.duration_ms ? Math.floor(t.duration_ms / 1000) : 0,
-               uri: t.uri,
-               provider: 'spotify',
-               source: 'spotify'
-             };
-          });
-        }
+        songs = trackRes.items.map(function(item){
+          var t = item.track || item;
+          return {
+            id: t.id,
+            name: t.name,
+            artist: (t.artists || []).map(function(a){ return a.name; }).join(', '),
+            album: t.album && t.album.name ? t.album.name : '',
+            cover: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : '',
+            duration: t.duration_ms ? Math.floor(t.duration_ms / 1000) : 0,
+            uri: t.uri,
+            provider: 'spotify',
+            source: 'spotify'
+          };
+        });
       }
+    } catch (e) {
+      console.warn('Spotify me/tracks fetch failed:', e);
     }
 
     if (token !== homeDiscoverToken) return;
@@ -17231,7 +17205,7 @@ if (window.MutationObserver && $results) {
   new MutationObserver(syncSearchAreaResultState).observe($results, { childList: true, attributes: true, attributeFilter: ['class'] });
 }
 function isMusicSearchMode(mode) {
-  return mode !== 'podcast';
+  return true;
 }
 function searchResultKey(q, mode) {
   return (mode || searchMode || 'song') + '|' + String(q || '').trim();
@@ -17296,46 +17270,20 @@ function runSearchHistory(q) {
   $input.focus();
 }
 function updateSearchModeTabs() {
-  var songBtn = document.getElementById('search-mode-song');
-  var neteaseBtn = document.getElementById('search-mode-netease');
-  var qqBtn = document.getElementById('search-mode-qq');
-  var podcastBtn = document.getElementById('search-mode-podcast');
-  if (songBtn) {
-    songBtn.classList.toggle('active', searchMode === 'song');
-    songBtn.setAttribute('aria-selected', searchMode === 'song' ? 'true' : 'false');
-  }
-  if (neteaseBtn) {
-    neteaseBtn.classList.toggle('active', searchMode === 'netease');
-    neteaseBtn.setAttribute('aria-selected', searchMode === 'netease' ? 'true' : 'false');
-  }
-  if (qqBtn) {
-    qqBtn.classList.toggle('active', searchMode === 'qq');
-    qqBtn.setAttribute('aria-selected', searchMode === 'qq' ? 'true' : 'false');
-  }
-  if (podcastBtn) {
-    podcastBtn.classList.toggle('active', searchMode === 'podcast');
-    podcastBtn.setAttribute('aria-selected', searchMode === 'podcast' ? 'true' : 'false');
-  }
   if ($input) {
-    $input.placeholder = searchMode === 'podcast'
-      ? '搜索播客、电台...'
-      : (searchMode === 'qq' ? '搜索 QQ 音乐...' : (searchMode === 'netease' ? '搜索网易云音乐...' : '搜索歌曲、歌手...'));
+    $input.placeholder = '搜索歌曲、歌手...';
   }
   requestAnimationFrame(updateSearchPillGlassDisplacementMap);
 }
 function setSearchMode(mode) {
-  mode = (mode === 'podcast' || mode === 'netease' || mode === 'qq') ? mode : 'song';
+  mode = 'song';
   if (searchMode === mode) return;
   searchMode = mode;
-  updateSearchModeTabs();
   clearSearchResults();
   var searchArea = document.getElementById('search-area');
   if (searchArea) setPeek(searchArea, true, 'search');
   var q = $input ? $input.value.trim() : '';
-  if (searchMode === 'podcast') {
-    if (q) doSearch(q);
-    else loadPodcastHot();
-  } else if (q) {
+  if (q) {
     doSearch(q);
   } else {
     renderSearchHistory();
@@ -17476,8 +17424,7 @@ $input.addEventListener('input', function(){
   clearTimeout(searchTimer);
   var q = $input.value.trim();
   if (!q) {
-    if (searchMode === 'podcast') loadPodcastHot();
-    else renderSearchHistory();
+    renderSearchHistory();
     return;
   }
   if (isMusicSearchMode(searchMode)) {
@@ -17539,11 +17486,12 @@ updateSearchModeTabs();
 
 function songProviderKey(song) {
   if (song && (song.provider === 'qq' || song.source === 'qq' || song.type === 'qq')) return 'qq';
+  if (song && (song.provider === 'spotify' || song.source === 'spotify' || song.type === 'spotify')) return 'spotify';
   return 'netease';
 }
 function songSourceTagHtml(song) {
   var key = songProviderKey(song);
-  var label = key === 'qq' ? 'QQ' : 'NE';
+  var label = key === 'qq' ? 'QQ' : (key === 'spotify' ? 'SP' : 'NE');
   return '<span class="tag-source ' + key + '">' + label + '</span>';
 }
 function searchResultMetaText(song) {
@@ -17677,37 +17625,23 @@ function mergeSongSearchResults(neteaseSongs, qqSongs, limit, q) {
   out.sort(function(a, b){ return (b._searchScore || 0) - (a._searchScore || 0); });
   return out.slice(0, limit);
 }
-async function fetchMusicSearchResults(q, mode) {
+async function fetchMusicSearchResults(q) {
   try {
-    if (window.desktopWindow && typeof window.desktopWindow.getPhantomSpotifyToken === 'function') {
-      let spToken = await window.desktopWindow.getPhantomSpotifyToken();
-      let retries = 0;
-      while (!spToken && retries < 10) {
-         await new Promise(r => setTimeout(r, 1000));
-         spToken = await window.desktopWindow.getPhantomSpotifyToken();
-         retries++;
-      }
-      if (spToken) {
-         let res = await window.desktopWindow.executePhantomSpotify(`
-           fetch('https://api.spotify.com/v1/search?q=' + encodeURIComponent('${q}') + '&type=track&limit=18', {
-             headers: { 'Authorization': 'Bearer ${spToken}' }
-           }).then(r => r.json())
-         `);
-         if (res && res.ok && res.result && res.result.tracks && res.result.tracks.items) { res = res.result; }
-         if (res && res.tracks && res.tracks.items) {
-           return res.tracks.items.map(t => ({
-             id: t.id,
-             name: t.name,
-             artist: t.artists.map(a => a.name).join(', '),
-             album: t.album.name,
-             cover: t.album.images && t.album.images[0] ? t.album.images[0].url : '',
-             duration: t.duration_ms ? Math.floor(t.duration_ms / 1000) : 0,
-             uri: t.uri,
-             provider: 'spotify',
-             source: 'spotify'
-           }));
-         }
-      }
+    var res = await apiJson('/api/spotify/search?q=' + encodeURIComponent(String(q).trim()));
+    if (res && res.tracks && res.tracks.items) {
+      return res.tracks.items.map(function(t){
+        return {
+          id: t.id,
+          name: t.name,
+          artist: (t.artists || []).map(function(a){ return a.name; }).join(', '),
+          album: t.album ? t.album.name : '',
+          cover: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : '',
+          duration: t.duration_ms ? Math.floor(t.duration_ms / 1000) : 0,
+          uri: t.uri,
+          provider: 'spotify',
+          source: 'spotify'
+        };
+      });
     }
   } catch (e) {
     console.warn('Spotify search failed:', e);
@@ -17746,18 +17680,12 @@ async function doSearch(q, opts) {
   opts = opts || {};
   q = String(q || '').trim();
   if (!q) {
-    if (searchMode === 'podcast') loadPodcastHot();
-    else renderSearchHistory();
-    return;
-  }
-  if (searchMode === 'podcast') {
-    doPodcastSearch(q);
+    renderSearchHistory();
     return;
   }
   var requestSeq = ++searchRequestSeq;
   try {
-    var mode = searchMode;
-    var songs = await fetchMusicSearchResults(q, mode);
+    var songs = await fetchMusicSearchResults(q);
     if (requestSeq !== searchRequestSeq || $input.value.trim() !== q) return;
     if (!songs.length) {
       playlist = [];
@@ -17766,7 +17694,7 @@ async function doSearch(q, opts) {
       $results.classList.add('show');
       return;
     }
-    searchLastResultQuery = searchResultKey(q, mode);
+    searchLastResultQuery = searchResultKey(q);
     rememberSearchQuery(q);
     renderSongSearchResults(songs);
     if (opts.autoPlayFirst) playSearchResult(0);
@@ -18521,35 +18449,29 @@ async function playQueueAt(idx, opts) {
     var qualityParam = '&quality=' + encodeURIComponent(requestedQuality);
 var data = null;
     if (songProviderKey(song) === 'spotify') {
+      // Play through Spotify Phantom Engine (external Chrome browser)
       try {
-        var qqSearch = await apiJson('/api/qq/search?keywords=' + encodeURIComponent(song.artist + ' ' + song.name) + '&limit=5');
-        if (qqSearch && qqSearch.songs && qqSearch.songs.length > 0) {
-          var best = qqSearch.songs[0];
-          data = await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(best.mid || best.songmid || best.id || '') + '&mediaMid=' + encodeURIComponent(best.mediaMid || best.media_mid || '') + qualityParam);
-        }
-        if (!data || !data.url) {
-          var neSearch = await apiJson('/api/search?keywords=' + encodeURIComponent(song.artist + ' ' + song.name) + '&limit=5');
-          if (neSearch && neSearch.songs && neSearch.songs.length > 0) {
-            data = await apiJson('/api/song/url?id=' + neSearch.songs[0].id + qualityParam);
-          }
+        if (window.desktopWindow && typeof window.desktopWindow.playPhantomSpotifyTrack === 'function') {
+          var spotifyUri = song.uri || ('spotify:track:' + song.id);
+          await window.desktopWindow.playPhantomSpotifyTrack(spotifyUri);
+          hideLoading();
+          // Mark as playing so the UI state matches and no retry loop is triggered
+          playing = true;
+          setPlayIcon(true);
+          forcePlaybackControlsInteractive();
+          showToast('正在通过 Spotify 播放...');
+          return;  // Playback handled by hidden Electron window
         }
       } catch (e) {
-        console.warn('Spotify fallback audio fetch failed', e);
+        console.warn('Spotify phantom playback failed:', e);
       }
-      if (!data) data = { url: null };
+      handlePlaybackUnavailable(song, { url: null });
+      return;
     } else {
       data = isQQPlayback
         ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
         : await apiJson('/api/song/url?id=' + song.id + qualityParam);
     }
-    if (token !== trackSwitchToken) return;
-    if (!data.url) {
-      if (isQQPlayback && await retryQQPlaybackWithCompatibleQuality(song, idx, token, opts, data, requestedQuality)) return;
-      if (await tryAutoPlaybackFallback(song, data, idx, token, opts)) return;
-      handlePlaybackUnavailable(song, data);
-      return;
-    }
-    var resolvedQualityText = playbackResolvedQualityText(data);
     if (!isQQPlayback && playbackQualityWasDowngraded(requestedQuality, data.level)) {
       showSourceFallbackNotice('网易云音质自动降级', '请求 ' + playbackQualityLabel(requestedQuality) + '，实际播放 ' + resolvedQualityText + '。');
     } else if (opts.qualitySwitch) {
@@ -23228,6 +23150,38 @@ function pulseUpdateReady() {
 // ============================================================
 //  登录系统
 // ============================================================
+var spotifyLoginStatus = { provider: 'spotify', loggedIn: false, nickname: 'Spotify', userId: '', avatar: '', product: '' };
+var spotifyCredentials = { clientId: '', hasSecret: false };
+
+async function refreshSpotifyLoginStatus() {
+  try {
+    var tokenRes = await apiJson('/api/spotify/token');
+    spotifyLoginStatus = (tokenRes && tokenRes.ok && tokenRes.token)
+      ? { provider: 'spotify', loggedIn: true, nickname: 'Spotify', userId: '', avatar: '', product: 'premium' }
+      : { provider: 'spotify', loggedIn: false };
+    if (spotifyLoginStatus.loggedIn) {
+      homeDiscoverState.loaded = false;
+      homeDiscoverState.loggedIn = true;
+    }
+    if (!hasPlatformLogin(activeAccountProvider)) activeAccountProvider = firstLoggedProvider();
+    renderUserBtn();
+    return spotifyLoginStatus;
+  } catch (e) {
+    console.warn('Spotify login status failed:', e);
+    spotifyLoginStatus = { provider: 'spotify', loggedIn: false };
+    renderUserBtn();
+    return spotifyLoginStatus;
+  }
+}
+
+async function loadSpotifyCredentials() {
+  try {
+    spotifyCredentials = { clientId: '', hasSecret: true };
+  } catch (e) {
+    console.warn('Spotify credentials load failed:', e);
+  }
+}
+
 function openGsapModal(mask) {
   if (!mask) return;
   var panel = mask.querySelector('.modal');
@@ -23303,11 +23257,11 @@ function onUserBtnClick() {
   else showLoginModal();
 }
 function platformMeta(provider) {
-  if (provider === 'qq') return { key: 'qq', short: 'QQ', label: 'QQ 音乐', app: 'QQ 音乐 App', dot: 'qq' };
-  return { key: 'netease', short: 'NE', label: '网易云音乐', app: '网易云音乐 App', dot: 'netease' };
+  if (provider === 'spotify') return { key: 'spotify', short: 'SP', label: 'Spotify', app: 'Spotify App', dot: 'spotify' };
+  return { key: 'spotify', short: 'SP', label: 'Spotify', app: 'Spotify App', dot: 'spotify' };
 }
 function platformStatus(provider) {
-  return provider === 'qq' ? qqLoginStatus : loginStatus;
+  return provider === 'spotify' ? spotifyLoginStatus : spotifyLoginStatus;
 }
 function providerVipType(provider, status) {
   status = status || platformStatus(provider) || {};
@@ -23344,13 +23298,12 @@ function hasPlatformLogin(provider) {
   return !!(st && st.loggedIn);
 }
 function hasAnyPlatformLogin() {
-  return hasPlatformLogin('netease') || hasPlatformLogin('qq');
+  return hasPlatformLogin('spotify');
 }
 function firstLoggedProvider() {
   if (hasPlatformLogin(activeAccountProvider)) return activeAccountProvider;
-  if (hasPlatformLogin('netease')) return 'netease';
-  if (hasPlatformLogin('qq')) return 'qq';
-  return 'netease';
+  if (hasPlatformLogin('spotify')) return 'spotify';
+  return 'spotify';
 }
 function providerAvatarSrc(provider, status) {
   status = status || platformStatus(provider) || {};
@@ -23463,14 +23416,7 @@ function startQQLoginStatusAutoRefresh() {
 function renderUserBtn() {
   var btn = document.getElementById('user-btn');
   if (!btn) return;
-  btn.classList.remove('multi-account');
-  if (dualAccountMode && hasAnyPlatformLogin()) {
-    activeAccountProvider = firstLoggedProvider();
-    btn.classList.add('logged-in', 'multi-account');
-    btn.classList.remove('logged-out');
-    btn.title = '账号信息 · 双平台登录状态';
-    btn.innerHTML = renderTopAccountPill('netease') + renderTopAccountPill('qq');
-  } else if (hasAnyPlatformLogin()) {
+  if (hasAnyPlatformLogin()) {
     activeAccountProvider = firstLoggedProvider();
     var st = platformStatus(activeAccountProvider);
     var meta = platformMeta(activeAccountProvider);
@@ -23489,16 +23435,13 @@ function renderUserBtn() {
   updatePlaybackQualityUi();
 }
 async function showLoginModal(opts) {
-  opts = opts || {};
-  if (opts.provider) loginProvider = opts.provider === 'qq' ? 'qq' : 'netease';
   var modal = document.getElementById('login-modal');
   openGsapModal(modal);
-  updateLoginProviderUi();
-  await refreshQr();
 }
 function closeLoginModal() {
-  stopQrPoll();
   closeGsapModal(document.getElementById('login-modal'));
+  // Refresh Spotify login status after closing login modal
+  setTimeout(function(){ refreshSpotifyLoginStatus(); }, 500);
 }
 function setLoginProvider(provider, silent) {
   loginProvider = provider === 'qq' ? 'qq' : 'netease';
@@ -23788,24 +23731,10 @@ function updateUserModalUi() {
   if (avatar) avatar.src = providerAvatarSrc(activeAccountProvider, st);
   if (name) name.textContent = (st && st.nickname) || meta.label;
   if (vipEl) {
-    if (activeAccountProvider === 'netease') {
-      var neVipLevel = providerVipLevel('netease', st);
-      var vipLabel = neVipLevel === 'svip' ? '网易云 SVIP' : (neVipLevel === 'vip' ? '网易云 VIP' : '普通用户');
-      vipEl.textContent = 'UID: ' + ((st && st.userId) || '-') + '  ·  ' + vipLabel;
-      vipEl.style.color = hasProviderVip('netease', st) ? 'rgba(244,210,138,0.86)' : 'rgba(255,255,255,0.5)';
-    } else {
-      var qqVipLabel = hasProviderVip('qq', st) ? 'QQ VIP 会员' : 'QQ 音乐会话';
-      vipEl.textContent = 'UID: ' + ((st && st.userId) || '-') + '  ·  ' + qqVipLabel;
-      vipEl.style.color = hasProviderVip('qq', st) ? 'rgba(0,245,212,0.82)' : 'rgba(0,245,212,0.58)';
-    }
+    var spLabel = (st && st.product) ? 'Spotify ' + st.product : 'Spotify Free';
+    vipEl.textContent = 'UID: ' + ((st && st.userId) || '-') + '  ·  ' + spLabel;
+    vipEl.style.color = st && st.product === 'premium' ? 'rgba(29,185,84,0.86)' : 'rgba(255,255,255,0.5)';
   }
-  ['netease','qq','both'].forEach(function(key){
-    var btn = document.getElementById('user-provider-' + key);
-    if (btn) btn.classList.toggle('active', key === 'both' ? dualAccountMode : (!dualAccountMode && activeAccountProvider === key));
-  });
-  if (addNetease) addNetease.style.display = hasPlatformLogin('netease') ? 'none' : '';
-  if (addQQ) addQQ.textContent = hasPlatformLogin('qq') ? '查看 QQ 音乐' : '补登 QQ 音乐';
-  if (logoutBtn) logoutBtn.textContent = activeAccountProvider === 'qq' ? '退出 QQ 音乐' : '退出网易云';
   if (hint) hint.textContent = dualAccountMode
     ? '右上角已切换为双平台并排展示。'
     : '可切换右上角展示的平台；“我两个都要”会并排放两个登录状态。';
@@ -26594,8 +26523,7 @@ if (fx.floatLayer) createFloatLayer();
 if (fx.particleLyrics) createLyricsParticles();
 if (fx.backCover) createBackCoverLayer();
 initIdleGuideCanvas();
-var startupLoginStatusPromise = Promise.all([refreshLoginStatus(), refreshQQLoginStatus()]);
-startQQLoginStatusAutoRefresh();
+var startupLoginStatusPromise = Promise.all([refreshSpotifyLoginStatus(), loadSpotifyCredentials()]);
 if (startupLoginStatusPromise && startupLoginStatusPromise.then) {
   startupLoginStatusPromise.then(function(){
     if (hasAnyPlatformLogin()) {
@@ -26606,6 +26534,8 @@ if (startupLoginStatusPromise && startupLoginStatusPromise.then) {
     var homeShown = updateEmptyHomeVisibility({ forceLoad: hasAnyPlatformLogin() });
     if (!hasAnyPlatformLogin()) maybeRunStartupLoginGuide('status');
     else if (!homeShown) maybeRunStartupLoginGuide('status');
+  }).catch(function(e){
+    console.warn('Startup login status check failed:', e);
   });
 }
 var collectNameInput = document.getElementById('collect-new-name');
